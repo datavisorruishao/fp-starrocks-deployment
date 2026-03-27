@@ -1,0 +1,134 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: starrocks-fe-config
+  namespace: duckdb
+  labels:
+    app.kubernetes.io/name: starrocks-fe
+    app.kubernetes.io/managed-by: manual
+data:
+  fe.conf: |
+    LOG_DIR = ${STARROCKS_HOME}/log
+    DATE = "$(date +%Y%m%d-%H%M%S)"
+    JAVA_OPTS="-Dlog4j2.formatMsgNoLookups=true -Xmx4096m -XX:+UseG1GC -XX:+HeapDumpOnOutOfMemoryError"
+
+    http_port = 8030
+    rpc_port = 9020
+    query_port = 9030
+    edit_log_port = 9010
+
+    # Shared-data mode
+    run_mode = shared_data
+    cloud_native_meta_port = 6090
+
+    # S3 storage for StarRocks internal data (MV segments, metadata)
+    cloud_native_storage_type = S3
+    aws_s3_use_instance_profile = true
+    aws_s3_region = us-west-2
+    aws_s3_endpoint = s3.us-west-2.amazonaws.com
+    aws_s3_bucket = datavisor-dev-us-west-2-iceberg
+    aws_s3_path = cre-6630/duckdb/starrocks-data/
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: starrocks-fe
+  namespace: duckdb
+  labels:
+    app.kubernetes.io/name: starrocks-fe
+    app.kubernetes.io/managed-by: manual
+spec:
+  type: ClusterIP
+  ports:
+    - name: mysql
+      port: 9030
+      targetPort: 9030
+      protocol: TCP
+    - name: http
+      port: 8030
+      targetPort: 8030
+      protocol: TCP
+    - name: rpc
+      port: 9020
+      targetPort: 9020
+      protocol: TCP
+    - name: edit-log
+      port: 9010
+      targetPort: 9010
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: starrocks-fe
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: starrocks-fe
+  namespace: duckdb
+  labels:
+    app.kubernetes.io/name: starrocks-fe
+    app.kubernetes.io/managed-by: manual
+spec:
+  serviceName: starrocks-fe
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: starrocks-fe
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: starrocks-fe
+    spec:
+      containers:
+        - name: starrocks-fe
+          image: starrocks/fe-ubuntu:3.3-latest
+          imagePullPolicy: IfNotPresent
+          command: ["/opt/starrocks/fe/bin/start_fe.sh"]
+          ports:
+            - containerPort: 8030
+              name: http
+            - containerPort: 9030
+              name: mysql
+            - containerPort: 9020
+              name: rpc
+            - containerPort: 9010
+              name: edit-log
+            - containerPort: 6090
+              name: cloud-meta
+          readinessProbe:
+            tcpSocket:
+              port: 9030
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: 9030
+            initialDelaySeconds: 60
+            periodSeconds: 20
+            timeoutSeconds: 5
+          resources:
+            requests:
+              cpu: "1"
+              memory: 4Gi
+            limits:
+              cpu: "2"
+              memory: 8Gi
+          volumeMounts:
+            - name: fe-config
+              mountPath: /opt/starrocks/fe/conf/fe.conf
+              subPath: fe.conf
+            - name: fe-meta
+              mountPath: /opt/starrocks/fe/meta
+      volumes:
+        - name: fe-config
+          configMap:
+            name: starrocks-fe-config
+  volumeClaimTemplates:
+    - metadata:
+        name: fe-meta
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: aws-ebs-csi
+        resources:
+          requests:
+            storage: 10Gi

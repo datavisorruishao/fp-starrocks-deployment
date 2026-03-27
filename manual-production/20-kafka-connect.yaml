@@ -1,0 +1,201 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: iceberg-kafka-connect
+  namespace: duckdb
+  labels:
+    app.kubernetes.io/name: iceberg-kafka-connect
+    app.kubernetes.io/managed-by: manual
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: iceberg-kafka-connect-connector
+  namespace: duckdb
+  labels:
+    app.kubernetes.io/name: iceberg-kafka-connect
+    app.kubernetes.io/managed-by: manual
+data:
+  connector.json: |
+    {
+      "name": "iceberg-sink-qaautotest",
+      "config": {
+        "connector.class": "org.apache.iceberg.connect.IcebergSinkConnector",
+        "tasks.max": "2",
+        "topics": "duckdb_fp_velocity-al-.qaautotest",
+        "iceberg.catalog.type": "rest",
+        "iceberg.catalog.uri": "http://iceberg-rest-catalog:8181",
+        "iceberg.catalog.s3.region": "us-west-2",
+        "iceberg.catalog.client.region": "us-west-2",
+        "iceberg.tables": "qaautotest.event_result",
+        "iceberg.tables.auto-create-enabled": "true",
+        "iceberg.tables.evolve-schema-enabled": "true",
+        "iceberg.control.commit.interval-ms": "60000",
+        "key.converter": "org.apache.kafka.connect.storage.StringConverter",
+        "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+        "value.converter.schemas.enable": "false",
+        "transforms": "featureResolver",
+        "transforms.featureResolver.type": "com.datavisor.demo.smt.FeatureResolverTransform",
+        "transforms.featureResolver.metadata.jdbc.url": "jdbc:mysql://fp-mysql.duckdb:3306/qaautotest",
+        "transforms.featureResolver.metadata.jdbc.user": "dv.ro",
+        "transforms.featureResolver.metadata.jdbc.password": "PLACEHOLDER_FROM_SECRET"
+      }
+    }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: iceberg-kafka-connect
+  namespace: duckdb
+  labels:
+    app.kubernetes.io/name: iceberg-kafka-connect
+    app.kubernetes.io/managed-by: manual
+spec:
+  type: ClusterIP
+  ports:
+    - name: rest
+      port: 8083
+      targetPort: rest
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: iceberg-kafka-connect
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: iceberg-kafka-connect
+  namespace: duckdb
+  labels:
+    app.kubernetes.io/name: iceberg-kafka-connect
+    app.kubernetes.io/managed-by: manual
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: iceberg-kafka-connect
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: iceberg-kafka-connect
+    spec:
+      serviceAccountName: iceberg-kafka-connect
+      initContainers:
+        - name: build-smt
+          image: maven:3.9-eclipse-temurin-17
+          imagePullPolicy: IfNotPresent
+          command:
+            - bash
+            - -c
+            - |
+              set -euo pipefail
+              mkdir -p /work/src/main/java/com/datavisor/demo/smt /build-out
+              cp /src/pom.xml /work/pom.xml
+              cp /src/FeatureResolverTransform.java /work/src/main/java/com/datavisor/demo/smt/FeatureResolverTransform.java
+              cd /work
+              mvn -q package -DskipTests
+              cp /work/target/fp-feature-smt-1.0-SNAPSHOT.jar /build-out/fp-feature-smt.jar
+          volumeMounts:
+            - name: smt-source
+              mountPath: /src
+              readOnly: true
+            - name: smt-build-out
+              mountPath: /build-out
+        - name: install-plugins
+          image: confluentinc/cp-kafka-connect-base:7.7.1
+          imagePullPolicy: IfNotPresent
+          command:
+            - bash
+            - -c
+            - |
+              set -euo pipefail
+              confluent-hub install --no-prompt --component-dir /plugins iceberg/iceberg-kafka-connect:1.9.2
+              mkdir -p /plugins/fp-feature-smt
+              cp /build-out/fp-feature-smt.jar /plugins/fp-feature-smt/fp-feature-smt.jar
+          volumeMounts:
+            - name: plugin-dir
+              mountPath: /plugins
+            - name: smt-build-out
+              mountPath: /build-out
+              readOnly: true
+      containers:
+        - name: kafka-connect
+          image: confluentinc/cp-kafka-connect-base:7.7.1
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: rest
+              containerPort: 8083
+              protocol: TCP
+          env:
+            - name: CONNECT_BOOTSTRAP_SERVERS
+              value: "kafka3.duckdb:9092"
+            - name: CONNECT_REST_PORT
+              value: "8083"
+            - name: CONNECT_GROUP_ID
+              value: "iceberg-connect-qaautotest"
+            - name: CONNECT_CONFIG_STORAGE_TOPIC
+              value: "iceberg-connect-qaautotest-configs"
+            - name: CONNECT_OFFSET_STORAGE_TOPIC
+              value: "iceberg-connect-qaautotest-offsets"
+            - name: CONNECT_STATUS_STORAGE_TOPIC
+              value: "iceberg-connect-qaautotest-status"
+            - name: CONNECT_CONFIG_STORAGE_REPLICATION_FACTOR
+              value: "3"
+            - name: CONNECT_OFFSET_STORAGE_REPLICATION_FACTOR
+              value: "3"
+            - name: CONNECT_STATUS_STORAGE_REPLICATION_FACTOR
+              value: "3"
+            - name: CONNECT_KEY_CONVERTER
+              value: "org.apache.kafka.connect.storage.StringConverter"
+            - name: CONNECT_VALUE_CONVERTER
+              value: "org.apache.kafka.connect.json.JsonConverter"
+            - name: CONNECT_VALUE_CONVERTER_SCHEMAS_ENABLE
+              value: "false"
+            - name: CONNECT_REST_ADVERTISED_HOST_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: CONNECT_PLUGIN_PATH
+              value: "/usr/share/java,/usr/share/confluent-hub-components,/plugins"
+            - name: AWS_REGION
+              value: "us-west-2"
+          livenessProbe:
+            httpGet:
+              path: /connectors
+              port: rest
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 5
+          readinessProbe:
+            httpGet:
+              path: /connectors
+              port: rest
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          volumeMounts:
+            - name: connector-config
+              mountPath: /etc/kafka-connect/connector
+              readOnly: true
+            - name: plugin-dir
+              mountPath: /plugins
+              readOnly: true
+      volumes:
+        - name: connector-config
+          configMap:
+            name: iceberg-kafka-connect-connector
+        - name: plugin-dir
+          emptyDir: {}
+        - name: smt-build-out
+          emptyDir: {}
+        - name: smt-source
+          configMap:
+            name: fp-feature-smt-source

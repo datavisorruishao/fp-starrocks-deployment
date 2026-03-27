@@ -1,0 +1,79 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: iceberg-catalog-mysql
+  labels:
+    app.kubernetes.io/name: iceberg-catalog-mysql
+    {{- include "chart.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - name: mysql
+      port: 3306
+      targetPort: mysql
+  selector:
+    app.kubernetes.io/name: iceberg-catalog-mysql
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: iceberg-catalog-mysql
+  labels:
+    app.kubernetes.io/name: iceberg-catalog-mysql
+    {{- include "chart.labels" . | nindent 4 }}
+spec:
+  serviceName: iceberg-catalog-mysql
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: iceberg-catalog-mysql
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: iceberg-catalog-mysql
+    spec:
+      containers:
+        - name: mysql
+          image: mysql:8.0
+          ports:
+            - name: mysql
+              containerPort: 3306
+          env:
+            - name: MYSQL_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: iceberg-catalog-mysql
+                  key: mysql-root-password
+            - name: MYSQL_DATABASE
+              value: "iceberg_catalog"
+            - name: MYSQL_USER
+              value: "iceberg"
+            - name: MYSQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: iceberg-catalog-mysql
+                  key: mysql-password
+          readinessProbe:
+            exec:
+              command: ["mysqladmin", "ping", "-h", "localhost"]
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command: ["mysqladmin", "ping", "-h", "localhost"]
+            initialDelaySeconds: 30
+            periodSeconds: 20
+          resources:
+            {{- toYaml .Values.iceberg.catalogMysql.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/mysql
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: {{ .Values.iceberg.catalogMysql.storageClass }}
+        resources:
+          requests:
+            storage: {{ .Values.iceberg.catalogMysql.storageSize }}

@@ -1,0 +1,116 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: starrocks-cn-config
+  namespace: duckdb
+  labels:
+    app.kubernetes.io/name: starrocks-cn
+    app.kubernetes.io/managed-by: manual
+data:
+  cn.conf: |
+    LOG_DIR = ${STARROCKS_HOME}/log
+    JAVA_OPTS="-Dlog4j2.formatMsgNoLookups=true -Xmx4096m -XX:+UseG1GC -XX:+HeapDumpOnOutOfMemoryError"
+
+    thrift_port = 9060
+    webserver_port = 8040
+    heartbeat_service_port = 9050
+    brpc_port = 8060
+    starlet_port = 9070
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: starrocks-cn
+  namespace: duckdb
+  labels:
+    app.kubernetes.io/name: starrocks-cn
+    app.kubernetes.io/managed-by: manual
+spec:
+  type: ClusterIP
+  clusterIP: None
+  ports:
+    - name: heartbeat
+      port: 9050
+      targetPort: 9050
+      protocol: TCP
+    - name: http
+      port: 8040
+      targetPort: 8040
+      protocol: TCP
+    - name: thrift
+      port: 9060
+      targetPort: 9060
+      protocol: TCP
+    - name: brpc
+      port: 8060
+      targetPort: 8060
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: starrocks-cn
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: starrocks-cn
+  namespace: duckdb
+  labels:
+    app.kubernetes.io/name: starrocks-cn
+    app.kubernetes.io/managed-by: manual
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: starrocks-cn
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: starrocks-cn
+    spec:
+      containers:
+        - name: starrocks-cn
+          image: starrocks/cn-ubuntu:3.3-latest
+          imagePullPolicy: IfNotPresent
+          command: ["/opt/starrocks/cn/bin/start_cn.sh"]
+          ports:
+            - containerPort: 9050
+              name: heartbeat
+            - containerPort: 8040
+              name: http
+            - containerPort: 9060
+              name: thrift
+            - containerPort: 8060
+              name: brpc
+            - containerPort: 9070
+              name: starlet
+          readinessProbe:
+            tcpSocket:
+              port: 9050
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: 9050
+            initialDelaySeconds: 60
+            periodSeconds: 20
+            timeoutSeconds: 5
+          resources:
+            requests:
+              cpu: "1"
+              memory: 4Gi
+            limits:
+              cpu: "2"
+              memory: 8Gi
+          volumeMounts:
+            - name: cn-config
+              mountPath: /opt/starrocks/cn/conf/cn.conf
+              subPath: cn.conf
+            - name: cn-cache
+              mountPath: /opt/starrocks/cn/storage
+      volumes:
+        - name: cn-config
+          configMap:
+            name: starrocks-cn-config
+        - name: cn-cache
+          emptyDir:
+            sizeLimit: 10Gi

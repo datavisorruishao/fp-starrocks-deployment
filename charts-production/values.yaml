@@ -1,0 +1,78 @@
+tenant: qaautotest
+
+iceberg:
+  catalogMysql:
+    storageSize: 20Gi
+    storageClass: aws-ebs-csi
+    rootPassword: "CHANGE_ME"
+    password: "CHANGE_ME"
+    resources:
+      requests:
+        cpu: 250m
+        memory: 512Mi
+      limits:
+        cpu: "1"
+        memory: 2Gi
+  restCatalog:
+    image: tabulario/iceberg-rest:1.6.0
+    warehouse: "s3://datavisor-dev-us-west-2-iceberg/cre-6630/duckdb/"
+    s3Region: us-west-2
+    resources:
+      requests:
+        cpu: 250m
+        memory: 512Mi
+      limits:
+        cpu: "1"
+        memory: 1Gi
+
+kafkaConnect:
+  image: confluentinc/cp-kafka-connect-base:7.7.1
+  icebergConnectorVersion: "1.9.2"
+  bootstrapServers: "kafka3.duckdb:9092"
+  replicationFactor: 3
+  connector:
+    topic: "duckdb_fp_velocity-al-.qaautotest"
+    table: "qaautotest.event_result"
+    tasksMax: 2
+    commitIntervalMs: 60000
+  smt:
+    jdbcUrl: "jdbc:mysql://fp-mysql.duckdb:3306/qaautotest"
+    jdbcUser: "dv.ro"
+    jdbcPassword: "password"
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1Gi
+    limits:
+      cpu: "2"
+      memory: 2Gi
+
+starrocks:
+  fe:
+    image: "starrocks/fe-ubuntu:3.3-latest"
+    replicas: 1
+    storageSize: 10Gi
+    storageClass: aws-ebs-csi
+    s3:
+      bucket: datavisor-dev-us-west-2-iceberg
+      region: us-west-2
+      path: "cre-6630/duckdb/starrocks-data/"
+      useInstanceProfile: true
+    resources:
+      requests:
+        cpu: "1"
+        memory: 4Gi
+      limits:
+        cpu: "2"
+        memory: 8Gi
+  cn:
+    image: "starrocks/cn-ubuntu:3.3-latest"
+    replicas: 1
+    cacheSizeLimit: 10Gi
+    resources:
+      requests:
+        cpu: "1"
+        memory: 4Gi
+      limits:
+        cpu: "2"
+        memory: 8Gi
