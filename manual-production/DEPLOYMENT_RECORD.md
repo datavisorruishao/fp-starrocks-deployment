@@ -11,15 +11,116 @@
 
 ### 1.1 组件清单
 
-| 组件 | K8s 类型 | Service | 镜像 |
-|------|---------|---------|------|
-| Iceberg Catalog MySQL | StatefulSet (1) | iceberg-catalog-mysql:3306 | mysql:8.0 |
-| Iceberg REST Catalog | Deployment (1) | iceberg-rest-catalog:8181 | tabulario/iceberg-rest:1.6.0 |
-| Kafka Connect + SMT | Deployment (1) | iceberg-kafka-connect:8083 | confluentinc/cp-kafka-connect-base:7.7.1 |
-| StarRocks FE | StatefulSet (1) | starrocks-fe:9030 | starrocks/fe-ubuntu:3.3-latest (v3.3.22) |
-| StarRocks CN | Deployment (1) | starrocks-cn:9050 | starrocks/cn-ubuntu:3.3-latest (v3.3.22) |
+| 组件 | 功能 | K8s 类型 | Service | 镜像 |
+|------|------|---------|---------|------|
+| Iceberg Catalog MySQL | 存储 Iceberg 表的元数据 (schema, partition, manifest 路径) | StatefulSet (1) | iceberg-catalog-mysql:3306 | mysql:8.0 |
+| Iceberg REST Catalog | Iceberg 元数据 REST API, 供 Kafka Connect 和 StarRocks 访问 | Deployment (1) | iceberg-rest-catalog:8181 | tabulario/iceberg-rest:1.6.0 |
+| Kafka Connect + SMT | 消费 velocity-al topic → SMT 将 featureMap 整数 ID 解析为列名 → 写 S3 Parquet (Iceberg 格式) | Deployment (1) | iceberg-kafka-connect:8083 | confluentinc/cp-kafka-connect-base:7.7.1 |
+| StarRocks FE | 查询规划、MV 调度、元数据管理。接受 fp-async 的 JDBC 连接 | StatefulSet (1) | starrocks-fe:9030 | starrocks/fe-ubuntu:3.3-latest (v3.3.22) |
+| StarRocks CN | 无状态计算节点。扫 S3 Parquet 做聚合/排序, 真正执行查询 | Deployment (1) | starrocks-cn:9050 | starrocks/cn-ubuntu:3.3-latest (v3.3.22) |
 
-### 1.2 部署顺序
+### 1.2 外部依赖 vs 我们部署的
+
+**我们部署的 (5 个 pod):**
+上面 1.1 的 5 个组件，全部是新增到 duckdb namespace。
+
+**外部依赖 (已存在，不动):**
+
+| 依赖 | 地址 | 用途 | 谁提供 |
+|------|------|------|--------|
+| Kafka | kafka3.duckdb:9092 (3 broker) | Kafka Connect 消费 velocity-al topic | 现有基础设施 |
+| FP MySQL | fp-mysql.duckdb:3306 | SMT 查 feature 表做 ID→name 映射 (dv.ro 只读) | 现有基础设施 |
+| S3 Bucket | datavisor-dev-us-west-2-iceberg | Kafka Connect 写 Parquet, StarRocks 读 Parquet | 现有基础设施 |
+| fp-async | fp-async.duckdb:8080 | 产生 velocity-al 消息 (我们的数据源) | 现有基础设施 |
+
+**velocity-al topic 命名规则**
+
+```
+{cluster_name}_fp_velocity-al-.{tenant}
+```
+
+| 环境 | 示例 |
+|------|------|
+| 生产 (prod cluster) | `prod_fp_velocity-al-.admin` |
+| 生产 (prod cluster) | `prod_fp_velocity-al-.baselane` |
+| Dev (duckdb cluster) | `duckdb_fp_velocity-al-.qaautotest` |
+
+新 tenant onboarding 时，Kafka Connect connector 配置里的 `topics` 字段就按此规则填。
+
+**数据来源: velocity-al topic 是怎么来的？**
+
+```
+客户请求
+  │
+  ▼
+FP API (Detection / Accumulate)
+  │  把事件写到 Kafka
+  ▼
+Kafka: {cluster}_fp_velocity.{tenant}        ← velocity topic (原始事件)
+  │
+  ▼
+fp-async Consumer
+  ├──→ 写 YugabyteDB (velocity 聚合数据，供实时查询)
+  │
+  └──→ 产生到 Kafka: {cluster}_fp_velocity-al-.{tenant}   ← 我们消费的 topic
+              │
+       ┌──────┴─────────────────────────┐
+       ▼                                ▼
+  ConsumerForCH                   Kafka Connect (我们新加的)
+  (已有，写 ClickHouse)            独立 consumer group，互不干扰
+                                        │ SMT 转换 featureMap
+                                        ▼
+                               S3 Parquet (Iceberg 格式)
+                                        │
+                                        ▼
+                               StarRocks FE → CN
+                               SELECT * FROM iceberg_catalog.{tenant}.event_result
+```
+
+**完整数据链路 (含 MV):**
+
+```
+                    [写入路径 - 实时]
+Kafka Connect → S3 Parquet (原始事件，每 60s 一批)
+
+                    [MV 刷新路径 - 凌晨批处理]
+CN Refresh 扫 S3 原始 Parquet
+→ GROUP BY (Dimension × Measure)
+→ 写 MV 日聚合分区 (几百行/天)
+
+                    [查询路径 - 在线毫秒级]
+fp-async Stats API → StarRocks FE → CN Query 读 MV
+→ 合并多个 daily 分区 → 返回 30d/90d/180d 聚合结果
+
+                    [降级路径 - MV 未就绪时]
+FE 自动 CBO rewrite → CN Query 扫原始 Parquet (慢但数据最新)
+```
+
+**本次验证中的真实数据 vs 手动数据:**
+
+| 数据 | 来源 | 说明 |
+|------|------|------|
+| velocity-al topic 结构 | fp-async 产生 | JSON: `{eventId, eventType, userId, eventTime, processingTime, featureMap}` |
+| 本次测试数据 | **手动** kafka-console-producer | 因为 FP 无法加载 qaautotest 租户，手动写入 |
+| 生产环境数据 | **自动** fp-async 持续产生 | 不需要手动 trigger |
+
+> **生产环境不需要手动 trigger。** fp-async 持续消费 velocity topic，每处理一个事件就产生一条 velocity-al 消息。Kafka Connect 实时消费，每 60s 做一次 Iceberg commit 写入 S3。
+
+### 1.3 Tenant 说明
+
+当前部署验证租户：**qaautotest** (duckdb namespace)
+
+| 配置项 | 值 |
+|--------|-----|
+| 命名空间 | duckdb |
+| 租户 | qaautotest |
+| velocity-al topic | `duckdb_fp_velocity-al-.qaautotest` |
+| topic 命名规则 | `{namespace}_fp_velocity-al-.{tenant}` — fp-async 标准格式 |
+| FP MySQL | fp-mysql.duckdb:3306/qaautotest (dv.ro 只读) |
+
+
+
+### 1.5 部署顺序
 
 必须按顺序部署，每步等前一步 Ready：
 
@@ -35,7 +136,7 @@
 32-starrocks-init         → Job: 注册 CN + 创建 Iceberg catalog (依赖 FE Ready)
 ```
 
-### 1.3 手动部署
+### 1.6 手动部署
 
 ```bash
 cp 00-secrets.example.yaml 00-secrets.yaml
@@ -43,7 +144,7 @@ cp 00-secrets.example.yaml 00-secrets.yaml
 bash deploy-duckdb.sh
 ```
 
-### 1.4 Helm 部署
+### 1.7 Helm 部署
 
 ```bash
 helm install starrocks-iceberg ./charts-production/ -n duckdb \
@@ -122,7 +223,7 @@ helm install starrocks-iceberg ./charts-production/ -n duckdb \
     → Kafka velocity-al topic ← 这是我们消费的数据源
 ```
 
-fp-async 写到 `velocity-al` topic 的消息格式（真实示例，来自 QA topic `cre6630_fp_velocity.yysecurity`）:
+fp-async 写到 `velocity-al` topic 的消息格式（示例来自 QA Kafka，消息结构与标准生产 topic `{cluster}_fp_velocity-al-.{tenant}` 相同）:
 
 ```json
 {
@@ -152,27 +253,76 @@ fp-async 写到 `velocity-al` topic 的消息格式（真实示例，来自 QA t
 
 ### 3.2 SMT 转换：featureMap 整数 ID → 列名
 
-`featureMap` 的 key 是 feature 的整数 ID（如 `"1"`, `"2"`），不是人类可读的名称。
-**FeatureResolverTransform (SMT)** 查询 FP MySQL 的 `feature` 表做映射：
+**为什么 featureMap 是整数 ID？**
 
-```sql
--- SMT 执行的查询 (fp-mysql.duckdb:3306/qaautotest, 用户 dv.ro, 只读)
-SELECT id, name, return_type FROM feature WHERE status = 'PUBLISHED';
--- qaautotest 有 705 个 PUBLISHED features
+fp-async 产生的 velocity-al 消息里，featureMap 的 key 是整数，不是名字——这是为了节省 Kafka 消息体积（高频场景，每个事件都有几百个 feature）：
+
+```json
+{
+  "eventId": "abc-123",
+  "eventType": "transaction",
+  "userId": "user_42",
+  "eventTime": 1774597200000,
+  "processingTime": 1774597201000,
+  "featureMap": {
+    "8":  299.99,
+    "7":  "US",
+    "15": "merchant_xyz"
+  }
+}
 ```
 
-转换过程：
+**SMT 做的事：**
+
+`FeatureResolverTransform` 在 Kafka Connect 处理每条消息时实时翻译：
+
 ```
-输入 (Kafka JSON):
-  {"featureMap": {"8": 299.99, "7": "US", "15": "merchant_xyz"}}
-                     ↓ SMT 查 MySQL: id=8 → name=amount, type=Double
-                     ↓              id=7 → name=country, type=String
-                     ↓              id=15 → name=merchant_id, type=String
-输出 (Iceberg Parquet):
-  amount=299.99 (DOUBLE), country="US" (STRING), merchant_id="merchant_xyz" (STRING)
+启动时 + 每 60s 刷新缓存:
+  SELECT id, name, return_type
+  FROM qaautotest.feature
+  WHERE status = 'PUBLISHED'
+  → qaautotest 有 705 个 PUBLISHED features
+
+  建立内存缓存:
+  { "8":  ["amount",      "Double"],
+    "7":  ["country",     "String"],
+    "15": ["merchant_id", "String"],
+    ...  (705 条) }
+
+处理每条消息:
+  featureMap {"8": 299.99, "7": "US", "15": "merchant_xyz"}
+       ↓ 查缓存，按 return_type 做类型转换
+  amount      = 299.99  → DOUBLE
+  country     = "US"    → STRING
+  merchant_id = "merchant_xyz" → STRING
+
+输出完整 Schema 的 Kafka Connect Record:
+  event_id | event_type    | user_id  | event_time    | amount | country | merchant_id | ...
+  abc-123  | transaction   | user_42  | 1774597200000 | 299.99 | US      | merchant_xyz| ...
+       ↓
+  写入 Iceberg Parquet (列式, 类型正确)
+       ↓
+  StarRocks 可以直接:
+  SELECT amount, country FROM iceberg_catalog.qaautotest.event_result
 ```
 
-**结果：** Iceberg 表有 5 个固定列 + N 个 feature 列（qaautotest 约 705 列）。
+**Iceberg 表结构：**
+
+| 列 | 来源 | 类型 |
+|----|------|------|
+| event_id | 固定字段 | STRING |
+| event_type | 固定字段 | STRING |
+| user_id | 固定字段 | STRING |
+| event_time | 固定字段 | LONG |
+| processing_time | 固定字段 | LONG |
+| amount | featureMap 解析 | DOUBLE |
+| country | featureMap 解析 | STRING |
+| merchant_id | featureMap 解析 | STRING |
+| ... (约 700 列) | featureMap 解析 | 按 return_type |
+
+Schema 是**动态的**：新增 feature 时 SMT 刷新缓存，Iceberg 自动 evolve schema（`iceberg.tables.evolve-schema-enabled: true`）。
+
+**本次测试的 featureMap 是空的 `{}`**，所以 Parquet 里只有 5 个固定列有值，其余约 700 列全为 NULL。
 
 ### 3.3 本次测试用的数据
 
@@ -369,7 +519,56 @@ mysql> SELECT * FROM iceberg_catalog.yysecurity.event_result LIMIT 1\G
           actions: [REJECT]
 ```
 
-### 3.7 完整验证 Checklist
+### 3.7 S3 实际文件结构（已验证）
+
+运行 `aws s3 ls s3://datavisor-dev-us-west-2-iceberg/cre-6630/duckdb/ --recursive` 得到：
+
+```
+data/
+  00001-...parquet   (手动部署第1批, 06:49, ~188KB)
+  00001-...parquet   (手动部署第2批, 06:50, ~188KB)
+  00001-...parquet   (Helm 部署,     07:05, ~188KB)
+
+metadata/
+  00000-...metadata.json   ← v0 表定义 (初始 schema)
+  00000-...metadata.json   ← v0 表定义 (Helm 重建后)
+  00001-...metadata.json   ← v1 表定义 (第1次 commit 后更新)
+  00002-...metadata.json   ← v2 表定义 (第2次 commit 后更新)
+  snap-XXX.avro            ← snapshot 文件 (每次 commit 一个)
+  XXX-m0.avro              ← manifest 文件 (记录本次 commit 包含哪些 parquet)
+```
+
+**各类文件的作用：**
+
+| 文件类型 | 例子 | 作用 |
+|---------|------|------|
+| `*.parquet` | `data/00001-xxx.parquet` | 实际行数据，列式存储，~188KB/批 |
+| `*.metadata.json` | `metadata/00002-xxx.metadata.json` | 表的当前状态：schema、分区定义、当前 snapshot 指针 |
+| `snap-xxx.avro` | `metadata/snap-8768xxx.avro` | Snapshot 描述：本次 commit 的时间戳、操作类型 (append)、指向哪个 manifest |
+| `xxx-m0.avro` | `metadata/9b5769xx-m0.avro` | Manifest 文件：列出本 snapshot 包含的所有 parquet 文件路径 + 统计信息 |
+
+**查一条数据时的读取链路：**
+
+```
+SELECT * FROM iceberg_catalog.qaautotest.event_result
+    ↓
+StarRocks FE 查 Iceberg REST Catalog
+    ↓ 找到最新的 metadata.json
+metadata.json → 指向当前 snapshot (snap-xxx.avro)
+    ↓
+snap-xxx.avro → 指向 manifest (xxx-m0.avro)
+    ↓
+xxx-m0.avro  → 列出所有 parquet 文件路径
+    ↓
+StarRocks CN 并行读取 S3 上的 .parquet 文件
+    ↓
+返回结果
+```
+
+每次 Kafka Connect commit (60s) = 1 个新 parquet 文件 + 更新一次 metadata 链。
+这就是为什么需要 **Compaction CronJob** — 文件会越积越多，需要定期合并。
+
+### 3.8 完整验证 Checklist
 
 - [ ] `kubectl get pods -nduckdb | grep -E 'starrocks|iceberg'` → 全部 Running
 - [ ] StarRocks FE 接受 JDBC 连接 (port 9030)
@@ -380,25 +579,6 @@ mysql> SELECT * FROM iceberg_catalog.yysecurity.event_result LIMIT 1\G
 - [ ] Kafka Connect 日志: `Committed snapshot` + `addedRecords > 0`
 - [ ] `SELECT COUNT(*)` → 行数匹配写入数
 - [ ] `SELECT *` → 固定字段正确 (event_id, event_type, user_id, event_time, processing_time)
-kubectl -n duckdb exec starrocks-fe-0 -- \
-  mysql -h 127.0.0.1 -P 9030 -u root -e "
-    SHOW CATALOGS;
-    SHOW COMPUTE NODES;
-    SELECT COUNT(*) FROM iceberg_catalog.qaautotest.event_result;
-    SELECT * FROM iceberg_catalog.qaautotest.event_result LIMIT 5;
-  "
-
-
-### 3.8 完整验证 checklist
-
-- [ ] `kubectl get pods -nduckdb | grep -E 'starrocks|iceberg'` → 全部 Running
-- [ ] StarRocks FE 接受 JDBC 连接 (port 9030)
-- [ ] `SHOW COMPUTE NODES;` → CN Alive=true
-- [ ] `SHOW CATALOGS;` → iceberg_catalog 存在
-- [ ] Connector status → RUNNING, 2 tasks RUNNING
-- [ ] 写入测试消息 → 等 60s（commit interval）
-- [ ] `SELECT COUNT(*)` → 行数匹配
-- [ ] `SELECT *` → 字段正确 (event_id, event_type, user_id, event_time, processing_time)
 
 ---
 
@@ -529,7 +709,181 @@ kafka-consumer-groups.sh --list | grep iceberg
 
 ---
 
-## 6. 清理
+## 7. 生产架构目标 vs 当前部署
+
+> 详细设计见 [brainstorm-summary.md](../brainstorm-summary.md) 和 [sizing-sheet.md](../sizing-sheet.md)
+
+### 7.1 当前 (dev_a 验证) vs 生产目标
+
+| 维度 | 当前 dev_a 部署 | 生产目标 |
+|------|----------------|----------|
+| StarRocks FE | ×1, 无 HA | ×3 HA (m6i.xlarge 4C/16G) |
+| StarRocks CN | ×1 通用 | CN Query ×2-3 (常驻) + CN Refresh ×0-4 (凌晨 spot) |
+| CN Pool 隔离 | 无 | Query Pool + Refresh Pool 分开 |
+| Kafka Connect | ×1 worker | ×2-3 workers |
+| Iceberg Catalog MySQL | Pod 内 MySQL | RDS MySQL |
+| Compaction | 未配置 | CronJob 每天凌晨 |
+| 监控 | 无 | Prometheus + Grafana |
+| 多租户 | 单 tenant | 每 tenant connector + Iceberg DB |
+
+### 7.2 Scaling 策略
+
+> **当前 manifests 和 Helm chart 不包含 HPA 和 dcluster 配置，这些是 TODO。**
+> 下面是生产目标设计。
+
+**哪个层面做 scaling:**
+
+| 组件 | 方式 | 当前状态 | 说明 |
+|------|------|---------|------|
+| FE (3 nodes) | **固定不动** | ✅ 已实现 (×1) | 查询规划, 不需要弹缩 |
+| Kafka Connect | **固定不动** | ✅ 已实现 (×1) | 吞吐稳定, 极少需要调整 |
+| CN Query | **HPA (reactive)** | ❌ TODO | 在线查询, 负载不可预测 |
+| CN Refresh | **dcluster + spot (proactive)** | ❌ TODO | 定时批任务, 跑完释放 |
+
+**为什么 batch 用 dcluster 而非 HPA:**
+
+| 维度 | HPA | dcluster + spot |
+|------|-----|-----------------|
+| 成本 | on-demand 全价 | spot 省 60-70% |
+| 时机 | 被动响应 | 主动定时, 任务前已 ready |
+| Spot 中断 | 不感知 | 可配 fallback on-demand |
+| 适用 | 在线查询 (不知何时来) | 批任务 (知道何时跑) |
+
+**CN 的两种角色及部署方式:**
+
+| | CN Query Pool | CN Refresh Pool |
+|--|---|---|
+| 用途 | 服务 fp-async Stats API 实时查询 | 凌晨 MV 刷新（扫原始数据做 GROUP BY）|
+| 常驻 | 是，replicas=2-3 | 否，平时 replicas=0 |
+| K8s 类型 | Deployment (无状态, 数据在 S3) | Deployment (平时 scale=0，CronJob 控制) |
+| 机器类型 | On-Demand / RI | Spot (通过 dcluster 申请) |
+| 节点选择 | 普通节点 | dcluster 申请的 spot 节点 (nodeSelector) |
+
+> **CN 不需要 StatefulSet。** Shared-Data 模式下 CN 完全无状态，数据全在 S3，本地只有 cache。随时可以起/停。
+
+**dcluster 是谁的工作？**
+
+- **完全是 infra 的工作**，不进 fp-async 代码，不在 FP 业务逻辑里
+- dcluster 只负责 EC2 资源申请和释放，CN pod 的起停和向 FE 注册是 infra 的 CronJob 负责
+
+**CN Refresh 完整流程 (生产目标, 需要 infra 实现):**
+
+```
+01:00  K8s CronJob 触发 (infra 写的脚本/Job)
+  ├─ ① 调用 dcluster API: 申请 N 台 spot EC2 (r6i.2xlarge)
+  │     dcluster 负责: 起 EC2 → 配置 → join K8s 集群
+  ├─ ② 等待 spot 节点出现在 K8s:
+  │     kubectl wait node --selector=dcluster-pool=cn-refresh --for=condition=Ready
+  ├─ ③ Scale up CN Refresh Deployment:
+  │     kubectl scale deployment/starrocks-cn-refresh --replicas=3
+  │     (pod 自动调度到 spot 节点 via nodeSelector)
+  ├─ ④ 等 CN pod Ready 后，向 FE 注册:
+  │     mysql -h starrocks-fe -P 9030 -u root -e
+  │       "ALTER SYSTEM ADD COMPUTE NODE 'cn-refresh-pod-1:9050';
+  │        ALTER SYSTEM ADD COMPUTE NODE 'cn-refresh-pod-2:9050';
+  │        ALTER SYSTEM ADD COMPUTE NODE 'cn-refresh-pod-3:9050';"
+  ├─ ⑤ 等待 StarRocks MV refresh 完成
+  │     (FE 凌晨自动触发，或 mysql 执行 REFRESH MATERIALIZED VIEW)
+  ├─ ⑥ 从 FE 注销 CN Refresh:
+  │     "ALTER SYSTEM DROP COMPUTE NODE 'cn-refresh-pod-1:9050'; ..."
+  ├─ ⑦ Scale down:
+  │     kubectl scale deployment/starrocks-cn-refresh --replicas=0
+  └─ ⑧ 调用 dcluster API: 释放 spot 机器
+
+~04:30 以后: fp-async 查询 Stats API
+  → StarRocks FE → CN Query Pool (常驻, 独立 Deployment)
+  → 读 MV (KB 级) → 毫秒返回
+```
+
+**在线查询需要多少 scaling？**
+
+如果 MV 设计合理: **几乎不需要**。在线查询只是读 MV 的几千行 (KB 级), 常驻 2-3 个小 CN 就够了。
+
+**HPA / dcluster 实现 TODO:**
+
+| 项 | 需要做的事 | 谁做 |
+|----|-----------|------|
+| 拆分 CN Query / Refresh 两个 Deployment | 现在合并在一个 Deployment，需要拆开 + nodeSelector | infra |
+| CN Query HPA | HPA 资源 (基于 CPU/内存 trigger) | infra |
+| CN Refresh CronJob | shell 脚本封装 dcluster 申请 + CN 起停 + FE 注册 | infra |
+| StarRocks Resource Group | `CREATE RESOURCE GROUP` 隔离 Query/Refresh 资源 | infra |
+| dcluster API 对接 | 了解 dcluster 申请接口的具体参数 | infra (需查 dcluster 文档) |
+
+### 7.3 资源配置参考 (Medium tenant 起步)
+
+| 组件 | 规格 | 数量 | 月成本 (1yr RI) |
+|------|------|------|----------------|
+| StarRocks FE | m6i.xlarge (4C/16G) | 1 | $87 |
+| StarRocks CN Query | r6i.xlarge (4C/32G) | 2-3 | $229-$344 |
+| StarRocks CN Refresh | r6i.2xlarge spot (4hr/day) | 2 | ~$15 |
+| Kafka Connect Worker | m6i.xlarge (4C/16G) | 2 | $174 |
+| Iceberg REST Catalog | m6i.large (2C/8G) | 1 | ~$70 |
+| S3 (180d retention) | 7.7 TB | - | $177 |
+| **合计** | | | **~$1,100-1,400/月** |
+
+详细 4 tier sizing → [sizing-sheet.md](../sizing-sheet.md)
+
+### 7.4 跨 Cluster 部署 (Per-cluster)
+
+决策：每个 cluster (A/B) 各部署一套，不做中心化。理由：
+
+1. 跟 ClickHouse、YugabyteDB、Kafka 模式一致
+2. fp-async JDBC 查询 StarRocks 需要 cluster 内低延迟
+3. A/B failover 零额外工作
+4. 故障隔离
+
+**Active vs Standby 资源:**
+
+| 组件 | Active Cluster | Standby Cluster |
+|------|---------------|-----------------|
+| Kafka Connect | 2-3 workers (正常运行) | 2-3 workers (**持续运行**, 保持 S3 数据同步) |
+| StarRocks FE | ×3 (HA) | ×1 (最小) |
+| StarRocks CN Query | ×2-3 | ×1 (warm standby) |
+| StarRocks CN Refresh | ×0-4 (凌晨 spot) | ×0 |
+| Standby 月成本增量 | — | ~$200-300 |
+
+**关键：** Standby 的 Kafka Connect 持续运行写 S3，failover 时 StarRocks scale up CN 即可立即服务。
+
+### 7.5 多租户 Onboarding
+
+共享基础设施 (部署一次)：FE、CN Pools、Connect Workers、REST Catalog、S3 Bucket
+
+Per-tenant (每个 client)：
+- Kafka Connect **connector** (JSON 配置, curl 注册到共享 worker)
+- Iceberg **database** (如 `yysecurity.raw_events`)
+- StarRocks **MV** (fp-async 自动创建)
+- S3 **路径前缀** (如 `s3://bucket/raw_events/tenant=yysecurity/`)
+
+**新 tenant 注册:**
+```bash
+curl -X POST http://iceberg-kafka-connect:8083/connectors -d '{
+  "name": "iceberg-sink-{tenant}",
+  "config": {
+    "topics": "duckdb_fp_velocity-al-.{tenant}",
+    "iceberg.tables": "{tenant}.event_result",
+    "transforms.featureResolver.metadata.jdbc.url": "jdbc:mysql://fp-mysql:3306/{tenant}",
+    ... (其余同模板)
+  }
+}'
+```
+
+### 7.6 剩余 TODO (行动优先级)
+
+| 优先级 | 事项 | 状态 | 说明 |
+|--------|------|------|------|
+| **P0** | StarRocks FE+CN 分离部署 | ✅ 完成 | dev_a 验证通过 |
+| **P0** | Helm Chart | ✅ 完成 | charts-production/ |
+| **P0** | CN 分 Query/Refresh 两个 pool | ❌ 待做 | 需要 StarRocks Resource Group + 两组 CN Deployment |
+| **P1** | Compaction CronJob | ❌ 待做 | 防 S3 小文件爆炸 |
+| **P1** | S3 Lifecycle Rule | ❌ 待做 | 热 180d → 温 IA → 冷 Glacier → 删 |
+| **P1** | 监控 | ❌ 待做 | FE/CN `:8030/metrics` → Prometheus → Grafana |
+| **P2** | 多租户 connector 模板化 | ❌ 待做 | 新 tenant = 一条命令 |
+| **P2** | dcluster 集成 | ❌ 待做 | spot CN 申请/注册/释放自动化 |
+| **P2** | Iceberg Catalog MySQL → RDS | ❌ 待做 | 生产不用 Pod 内 MySQL |
+
+---
+
+## 8. 清理
 
 ```bash
 # Helm 方式
