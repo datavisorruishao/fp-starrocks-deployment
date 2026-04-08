@@ -1,6 +1,6 @@
 # fp-starrocks-deployment
 
-Helm charts for the CRE-6630 Feature Stats storage and query pipeline.
+Helm charts for the FP-11811 Feature Stats storage and query pipeline.
 
 ## Overview
 
@@ -9,7 +9,7 @@ The project is split into three parts deployed independently:
 | Part | Chart | Owner | Status |
 |------|-------|-------|--------|
 | 1 — Iceberg storage | `charts-iceberg/` | infra (ruishao) | Production |
-| 2 — FP Java integration | `feature-platform_CRE-6630` branch | backend | Production |
+| 2 — FP Java integration | `feature-platform_FP-11811` branch | backend | Production |
 | 3 — StarRocks query engine | `charts-production/` | infra (ruishao) | Production |
 
 ### Architecture
@@ -71,5 +71,5 @@ Passwords are never stored in `values.yaml`. Sensitive credentials are held in p
 
 ## Related
 
-- FP Java changes: `feature-platform_CRE-6630` branch (`analytic/IcebergService.java`, `APTenantService.java`, `YAMLConfig.java`)
-- Jira: CRE-6630
+- FP Java changes: `feature-platform_FP-11811` branch (`analytic/IcebergService.java`, `APTenantService.java`, `YAMLConfig.java`)
+- Jira: FP-11811

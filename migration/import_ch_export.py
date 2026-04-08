@@ -49,7 +49,7 @@ from pyiceberg.exceptions import NoSuchTableError
 BATCH_SIZE = 50_000   # rows per Iceberg append (wide schema → smaller batches)
 
 # Fixed column renames: CH name → Iceberg name (applied to every tenant).
-# Mirrors COLUMN_ALIASES in migrate.py and the SMT's buildSchema() output.
+# Matches the live Kafka Connect + FeatureResolverTransform SMT pipeline output.
 BASE_RENAMES = {
     "time":                 "eventTime",
     "timeInserted":         "processingTime",
@@ -421,6 +421,13 @@ def run(args):
             key=lambda k: k.split("/")[-1],
         )
         print(f"Found {len(files)} CH export file(s) in {args.s3_source}")
+    elif args.s3_file:
+        src_fs = s3fs.S3FileSystem(anon=False)
+        files = sorted(
+            [f.replace("s3://", "") for f in args.s3_file],
+            key=lambda k: k.split("/")[-1],
+        )
+        print(f"Processing {len(files)} explicit S3 file(s)")
     else:
         src_fs = None
         files = args.local_file
@@ -468,7 +475,12 @@ def main():
     src = parser.add_mutually_exclusive_group(required=True)
     src.add_argument(
         "--s3-source", metavar="S3_PREFIX",
-        help="S3 prefix containing export files, e.g. s3://datavisor-rippling/DATASET/raw__/",
+        help="S3 prefix — auto-discovers all ch-exporter-event_result files under the prefix, "
+             "e.g. s3://datavisor-rippling/DATASET/raw__/",
+    )
+    src.add_argument(
+        "--s3-file", nargs="+", metavar="S3_URI",
+        help="Explicit S3 file path(s), e.g. s3://datavisor-rippling/DATASET/raw__/raw__ch-exporter-event_result-*.csv.gz",
     )
     src.add_argument(
         "--local-file", nargs="+", metavar="FILE",
@@ -476,19 +488,30 @@ def main():
     )
 
     parser.add_argument("--tenant",              required=True,
-                        help="Iceberg namespace (e.g. rippling)")
+                        help="Iceberg namespace — must match the tenant name in FP "
+                             "(e.g. rippling). The Iceberg table will be {tenant}.event_result.")
     parser.add_argument("--iceberg-catalog-url", required=True,
-                        help="Iceberg REST catalog URL")
+                        help="Iceberg REST catalog URL. "
+                             "This is the K8s service deployed by charts-iceberg. "
+                             "Inside the cluster: http://iceberg-rest-catalog:8181. "
+                             "From outside, use kubectl port-forward: "
+                             "kubectl port-forward svc/iceberg-rest-catalog 8181:8181 "
+                             "then use http://localhost:8181.")
     parser.add_argument("--aws-region",          default="us-west-2")
 
-    # ClickHouse connection — optional but recommended for dynamic schema discovery
+    # ClickHouse connection — optional but recommended for dynamic schema discovery.
+    # The CH HTTP interface runs on port 8123 (not the native port 9000).
+    # In preprod/prod the CH host is typically the internal K8s service or a direct
+    # node IP — check the FP application.yaml clickhouseUrl for the correct host.
     parser.add_argument("--clickhouse-url",      default=None,
-                        help="ClickHouse HTTP URL (e.g. http://host:8123). "
-                             "Required for dynamic array-column and primary-key discovery.")
+                        help="ClickHouse HTTP interface URL (port 8123, not 9000). "
+                             "Find the host in FP application.yaml (clickhouseUrl). "
+                             "Example: http://chi-dv-datavisor-0-0-0.clickhouse.svc:8123")
     parser.add_argument("--clickhouse-user",     default="default")
     parser.add_argument("--clickhouse-password", default="")
     parser.add_argument("--clickhouse-db",       default=None,
-                        help="ClickHouse database name (defaults to --tenant if omitted)")
+                        help="ClickHouse database name — usually the same as --tenant "
+                             "(defaults to --tenant if omitted)")
 
     parser.add_argument("--primary-key",         default=None,
                         help="CH column to rename to 'userId'. "

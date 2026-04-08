@@ -33,42 +33,47 @@ does not yet exist, the script creates it automatically from the first batch's s
 
 ## Usage
 
-### With ClickHouse connection (recommended)
+### Recommended: explicit S3 files
 
-Dynamically discovers array columns and primary key from CH `system.columns` / `system.tables`:
+Pick the specific weekly files you want to import (e.g. last month) from `aws s3 ls`:
 
 ```bash
 python import_ch_export.py \
     --tenant rippling \
-    --s3-source s3://datavisor-rippling/DATASET/raw__/ \
+    --s3-file \
+        s3://datavisor-rippling/DATASET/raw__/raw__ch-exporter-event_result-1772838000460-42D2AFBF804A14FC266D9DC9026BC6D5.csv.gz \
+        s3://datavisor-rippling/DATASET/raw__/raw__ch-exporter-event_result-1773442800327-42D2AFBF804A14FC266D9DC9026BC6D5.csv.gz \
+        s3://datavisor-rippling/DATASET/raw__/raw__ch-exporter-event_result-1774047602243-42D2AFBF804A14FC266D9DC9026BC6D5.csv.gz \
+        s3://datavisor-rippling/DATASET/raw__/raw__ch-exporter-event_result-1774652415054-42D2AFBF804A14FC266D9DC9026BC6D5.csv.gz \
     --iceberg-catalog-url http://iceberg-rest-catalog:8181 \
-    --clickhouse-url http://clickhouse-rippling:8123 \
+    --clickhouse-url http://chi-dv-datavisor-0-0-0.clickhouse.svc:8123 \
     --aws-region us-west-2
 ```
 
 `--clickhouse-db` defaults to `--tenant` if omitted.
 
-### Without ClickHouse connection
+### Auto-discover all files under a prefix
 
-Array columns are stored as raw strings. `--primary-key` must be provided explicitly:
+Scans the entire prefix and imports every matching file. Use when you want to import all
+available history:
 
 ```bash
 python import_ch_export.py \
     --tenant rippling \
     --s3-source s3://datavisor-rippling/DATASET/raw__/ \
     --iceberg-catalog-url http://iceberg-rest-catalog:8181 \
-    --primary-key customer_id \
+    --clickhouse-url http://chi-dv-datavisor-0-0-0.clickhouse.svc:8123 \
     --aws-region us-west-2
 ```
 
-### Local file (testing)
+### Local file (testing only)
 
 ```bash
 python import_ch_export.py \
     --tenant rippling \
     --local-file ./raw__ch-exporter-event_result-*.csv.gz \
-    --iceberg-catalog-url http://iceberg-rest-catalog:8181 \
-    --clickhouse-url http://clickhouse-rippling:8123 \
+    --iceberg-catalog-url http://localhost:8181 \
+    --clickhouse-url http://localhost:8123 \
     --dry-run
 ```
 
@@ -77,10 +82,11 @@ python import_ch_export.py \
 | Flag | Required | Description |
 |---|---|---|
 | `--tenant` | yes | Iceberg namespace (e.g. `rippling`) |
-| `--s3-source` | yes* | S3 prefix containing export files |
+| `--s3-file` | yes* | **Recommended.** Explicit S3 file path(s) — one or more full `s3://` URIs |
+| `--s3-source` | yes* | S3 prefix — auto-discovers all matching files under the prefix |
 | `--local-file` | yes* | Local CSV.gz file(s) — for testing only |
-| `--iceberg-catalog-url` | yes | Iceberg REST catalog URL |
-| `--clickhouse-url` | no | CH HTTP endpoint — enables dynamic schema discovery |
+| `--iceberg-catalog-url` | yes | Iceberg REST catalog URL (see note below) |
+| `--clickhouse-url` | no | CH HTTP interface URL, port 8123 (see note below) |
 | `--clickhouse-user` | no | CH username (default: `default`) |
 | `--clickhouse-password` | no | CH password |
 | `--clickhouse-db` | no | CH database (defaults to `--tenant`) |
@@ -88,7 +94,18 @@ python import_ch_export.py \
 | `--aws-region` | no | AWS region (default: `us-west-2`) |
 | `--dry-run` | no | Parse and count rows, skip Iceberg writes |
 
-\* `--s3-source` and `--local-file` are mutually exclusive; one is required.
+\* `--s3-file`, `--s3-source`, and `--local-file` are mutually exclusive; one is required.
+
+### URL notes
+
+**`--iceberg-catalog-url`**: the K8s service deployed by `charts-iceberg`.
+- Inside the cluster: `http://iceberg-rest-catalog:8181`
+- From outside, use port-forward: `kubectl port-forward svc/iceberg-rest-catalog 8181:8181`
+  then use `http://localhost:8181`
+
+**`--clickhouse-url`**: the CH HTTP interface (port **8123**, not the native port 9000).
+Find the correct host in FP's `application.yaml` under `clickhouseUrl`.
+Example: `http://chi-dv-datavisor-0-0-0.clickhouse.svc:8123`
 
 ## Column mapping
 
@@ -130,13 +147,14 @@ The script writes `import_ch_export_state_{tenant}.json` after each file:
 
 ```json
 {
-  "raw__ch-exporter-event_result-1775257218377-42D2AFBF.csv.gz": "DONE",
-  "raw__ch-exporter-event_result-1775862018377-8F3C1A2B.csv.gz": "DONE"
+  "raw__ch-exporter-event_result-1764370800204-42D2AFBF804A14FC266D9DC9026BC6D5.csv.gz": "DONE",
+  "raw__ch-exporter-event_result-1764975600842-42D2AFBF804A14FC266D9DC9026BC6D5.csv.gz": "DONE",
+  "raw__ch-exporter-event_result-1765580418847-42D2AFBF804A14FC266D9DC9026BC6D5.csv.gz": "FAILED"
 }
 ```
 
-Re-runs skip files already marked `DONE`. To force re-import of a specific file, delete its
-entry from the state file (or delete the whole file to restart from scratch).
+Re-runs skip files already marked `DONE`. `FAILED` files are retried automatically.
+To force re-import of a specific file, delete its entry (or delete the whole file to restart).
 
 ## Verification
 
