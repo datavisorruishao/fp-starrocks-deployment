@@ -37,6 +37,9 @@ public class FeatureResolverTransform<R extends ConnectRecord<R>> implements Tra
     // id (as string) → [name, return_type]
     private final ConcurrentHashMap<String, String[]> featureMetadata = new ConcurrentHashMap<>();
 
+    // id (as string) → [name, type]
+    private final ConcurrentHashMap<String, String[]> eventAttrMetadata = new ConcurrentHashMap<>();
+
     private Thread refreshThread;
     private final AtomicBoolean running = new AtomicBoolean(true);
 
@@ -77,7 +80,7 @@ public class FeatureResolverTransform<R extends ConnectRecord<R>> implements Tra
 
         log.info("Loading feature metadata from MySQL: {}", jdbcUrl);
         loadFeatureMetadata();
-        log.info("Loaded {} feature mappings", featureMetadata.size());
+        log.info("Loaded {} feature mappings, {} event attr mappings", featureMetadata.size(), eventAttrMetadata.size());
 
         refreshThread = new Thread(() -> {
             while (running.get()) {
@@ -108,9 +111,24 @@ public class FeatureResolverTransform<R extends ConnectRecord<R>> implements Tra
                 String returnType = rs.getString("return_type");
                 featureMetadata.put(id, new String[]{name, returnType});
             }
-            metadataVersion++;
         } catch (SQLException e) {
             log.error("Failed to load feature metadata from MySQL", e);
+        }
+
+        String sql2 = "SELECT id, name, type FROM event_attribute_info";
+        try (Connection conn = DriverManager.getConnection(jdbcUrl, jdbcUser, jdbcPassword);
+             PreparedStatement stmt = conn.prepareStatement(sql2);
+             ResultSet rs = stmt.executeQuery()) {
+
+            while (rs.next()) {
+                String id = String.valueOf(rs.getInt("id"));
+                String name = rs.getString("name");
+                String type = rs.getString("type");
+                eventAttrMetadata.put(id, new String[]{name, type});
+            }
+            metadataVersion++;
+        } catch (SQLException e) {
+            log.error("Failed to load event_attribute_info from MySQL", e);
         }
     }
 
@@ -135,12 +153,21 @@ public class FeatureResolverTransform<R extends ConnectRecord<R>> implements Tra
         Schema schema = cachedSchema;
         Struct struct = new Struct(schema);
 
-        // Copy fixed fields
-        setIfPresent(struct, schema, "event_id", toString(value.get("eventId")));
-        setIfPresent(struct, schema, "event_type", toString(value.get("eventType")));
-        setIfPresent(struct, schema, "user_id", toString(value.get("userId")));
-        setIfPresent(struct, schema, "event_time", toLong(value.get("eventTime")));
-        setIfPresent(struct, schema, "processing_time", toLong(value.get("processingTime")));
+        // Copy fixed fields — all CH event_result fixed columns available in Kafka message
+        // camelCase names avoid collision with feature/event-attr columns of the same name
+        setIfPresent(struct, schema, "eventId",           toString(value.get("eventId")));
+        setIfPresent(struct, schema, "eventType",          toString(value.get("eventType")));
+        setIfPresent(struct, schema, "userId",             toString(value.get("userId")));
+        setIfPresent(struct, schema, "eventTime",          toLong(value.get("time")));
+        setIfPresent(struct, schema, "processingTime",     toLong(value.get("processTime")));
+        setIfPresent(struct, schema, "rules",              toIntList(value.get("rules")));
+        setIfPresent(struct, schema, "actions",            toStringList(value.get("actions")));
+        setIfPresent(struct, schema, "trialRules",         toIntList(value.get("trialRules")));
+        setIfPresent(struct, schema, "trialActions",       toStringList(value.get("trialActions")));
+        setIfPresent(struct, schema, "reEvaluateEntity",   toString(value.get("reEvaluateEntity")));
+        setIfPresent(struct, schema, "originId",           toInt(value.get("originId")));
+        setIfPresent(struct, schema, "originCategory",     toString(value.get("originCategory")));
+        setIfPresent(struct, schema, "fromUpdateAPI",      toBoolean(value.get("fromUpdateAPI")));
 
         // Resolve featureMap: {8: 100.50, 7: "US"} → {amount: 100.50 (double), country: "US" (string)}
         Object featureMapObj = value.get(featureMapField);
@@ -156,6 +183,18 @@ public class FeatureResolverTransform<R extends ConnectRecord<R>> implements Tra
             }
         }
 
+        // Resolve eventFields: {4: "u001", 18: "txn_001"} → named columns via event_attribute_info
+        Object eventFieldsObj = value.get("eventFields");
+        if (eventFieldsObj instanceof Map) {
+            Map<String, Object> eventFields = (Map<String, Object>) eventFieldsObj;
+            for (Map.Entry<String, Object> entry : eventFields.entrySet()) {
+                String[] meta = eventAttrMetadata.get(entry.getKey());
+                if (meta != null && schema.field(meta[0]) != null) {
+                    setTypedField(struct, schema, meta[0], entry.getValue(), meta[1]);
+                }
+            }
+        }
+
         return record.newRecord(
                 record.topic(), record.kafkaPartition(),
                 record.keySchema(), record.key(),
@@ -167,22 +206,42 @@ public class FeatureResolverTransform<R extends ConnectRecord<R>> implements Tra
     private Schema buildSchema() {
         SchemaBuilder builder = SchemaBuilder.struct().name("fp_event_result");
 
-        // Fixed columns
-        builder.field("event_id", Schema.OPTIONAL_STRING_SCHEMA);
-        builder.field("event_type", Schema.OPTIONAL_STRING_SCHEMA);
-        builder.field("user_id", Schema.OPTIONAL_STRING_SCHEMA);
-        builder.field("event_time", Schema.OPTIONAL_INT64_SCHEMA);
-        builder.field("processing_time", Schema.OPTIONAL_INT64_SCHEMA);
+        // Fixed columns — camelCase to avoid collision with feature/event-attr columns
+        builder.field("eventId",          Schema.OPTIONAL_STRING_SCHEMA);
+        builder.field("eventType",         Schema.OPTIONAL_STRING_SCHEMA);
+        builder.field("userId",            Schema.OPTIONAL_STRING_SCHEMA);
+        builder.field("eventTime",         Schema.OPTIONAL_INT64_SCHEMA);
+        builder.field("processingTime",    Schema.OPTIONAL_INT64_SCHEMA);
+        builder.field("rules",             SchemaBuilder.array(Schema.INT32_SCHEMA).optional().build());
+        builder.field("actions",           SchemaBuilder.array(Schema.STRING_SCHEMA).optional().build());
+        builder.field("trialRules",        SchemaBuilder.array(Schema.INT32_SCHEMA).optional().build());
+        builder.field("trialActions",      SchemaBuilder.array(Schema.STRING_SCHEMA).optional().build());
+        builder.field("reEvaluateEntity",  Schema.OPTIONAL_STRING_SCHEMA);
+        builder.field("originId",          Schema.OPTIONAL_INT32_SCHEMA);
+        builder.field("originCategory",    Schema.OPTIONAL_STRING_SCHEMA);
+        builder.field("fromUpdateAPI",     Schema.OPTIONAL_BOOLEAN_SCHEMA);
 
-        // Feature columns with proper types from return_type
+        // Feature/event-attribute columns with proper types from return_type
         Set<String> added = new HashSet<>(Arrays.asList(
-                "event_id", "event_type", "user_id", "event_time", "processing_time"));
+                "eventId", "eventType", "userId", "eventTime", "processingTime",
+                "rules", "actions", "trialRules", "trialActions", "reEvaluateEntity",
+                "originId", "originCategory", "fromUpdateAPI"));
 
         for (String[] meta : featureMetadata.values()) {
             String name = meta[0];
             String returnType = meta[1];
             if (!added.contains(name)) {
                 builder.field(name, toConnectSchema(returnType));
+                added.add(name);
+            }
+        }
+
+        // Event attribute columns (skip if already added by featureMetadata)
+        for (String[] meta : eventAttrMetadata.values()) {
+            String name = meta[0];
+            String type = meta[1];
+            if (!added.contains(name)) {
+                builder.field(name, toConnectSchema(type));
                 added.add(name);
             }
         }
@@ -249,7 +308,10 @@ public class FeatureResolverTransform<R extends ConnectRecord<R>> implements Tra
     private Double toDouble(Object v) {
         if (v == null) return null;
         if (v instanceof Number) return ((Number) v).doubleValue();
-        return Double.parseDouble(v.toString());
+        String s = v.toString();
+        if (s.equals("Infinity") || s.equals("+Infinity") || s.equals("-Infinity") || s.equals("NaN"))
+            return null;  // Parquet rejects these
+        return Double.parseDouble(s);
     }
 
     private Float toFloat(Object v) {
@@ -272,6 +334,25 @@ public class FeatureResolverTransform<R extends ConnectRecord<R>> implements Tra
 
     private String toString(Object v) {
         return v == null ? null : v.toString();
+    }
+
+    private List<Integer> toIntList(Object v) {
+        if (!(v instanceof List)) return null;
+        List<?> list = (List<?>) v;
+        List<Integer> result = new ArrayList<>(list.size());
+        for (Object item : list) {
+            if (item instanceof Number) result.add(((Number) item).intValue());
+            else if (item != null) result.add(Integer.parseInt(item.toString()));
+        }
+        return result;
+    }
+
+    private List<String> toStringList(Object v) {
+        if (!(v instanceof List)) return null;
+        List<?> list = (List<?>) v;
+        List<String> result = new ArrayList<>(list.size());
+        for (Object item : list) result.add(item == null ? null : item.toString());
+        return result;
     }
 
     @Override

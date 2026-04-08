@@ -153,12 +153,21 @@ public class FeatureResolverTransform<R extends ConnectRecord<R>> implements Tra
         Schema schema = cachedSchema;
         Struct struct = new Struct(schema);
 
-        // Copy fixed fields
-        setIfPresent(struct, schema, "event_id", toString(value.get("eventId")));
-        setIfPresent(struct, schema, "event_type", toString(value.get("eventType")));
-        setIfPresent(struct, schema, "user_id", toString(value.get("userId")));
-        setIfPresent(struct, schema, "event_time", toLong(value.get("time")));
-        setIfPresent(struct, schema, "processing_time", toLong(value.get("processTime")));
+        // Copy fixed fields — all CH event_result fixed columns available in Kafka message
+        // camelCase names avoid collision with feature/event-attr columns of the same name
+        setIfPresent(struct, schema, "eventId",           toString(value.get("eventId")));
+        setIfPresent(struct, schema, "eventType",          toString(value.get("eventType")));
+        setIfPresent(struct, schema, "userId",             toString(value.get("userId")));
+        setIfPresent(struct, schema, "eventTime",          toLong(value.get("time")));
+        setIfPresent(struct, schema, "processingTime",     toLong(value.get("processTime")));
+        setIfPresent(struct, schema, "rules",              toIntList(value.get("rules")));
+        setIfPresent(struct, schema, "actions",            toStringList(value.get("actions")));
+        setIfPresent(struct, schema, "trialRules",         toIntList(value.get("trialRules")));
+        setIfPresent(struct, schema, "trialActions",       toStringList(value.get("trialActions")));
+        setIfPresent(struct, schema, "reEvaluateEntity",   toString(value.get("reEvaluateEntity")));
+        setIfPresent(struct, schema, "originId",           toInt(value.get("originId")));
+        setIfPresent(struct, schema, "originCategory",     toString(value.get("originCategory")));
+        setIfPresent(struct, schema, "fromUpdateAPI",      toBoolean(value.get("fromUpdateAPI")));
 
         // Resolve featureMap: {8: 100.50, 7: "US"} → {amount: 100.50 (double), country: "US" (string)}
         Object featureMapObj = value.get(featureMapField);
@@ -197,16 +206,26 @@ public class FeatureResolverTransform<R extends ConnectRecord<R>> implements Tra
     private Schema buildSchema() {
         SchemaBuilder builder = SchemaBuilder.struct().name("fp_event_result");
 
-        // Fixed columns
-        builder.field("event_id", Schema.OPTIONAL_STRING_SCHEMA);
-        builder.field("event_type", Schema.OPTIONAL_STRING_SCHEMA);
-        builder.field("user_id", Schema.OPTIONAL_STRING_SCHEMA);
-        builder.field("event_time", Schema.OPTIONAL_INT64_SCHEMA);
-        builder.field("processing_time", Schema.OPTIONAL_INT64_SCHEMA);
+        // Fixed columns — camelCase to avoid collision with feature/event-attr columns
+        builder.field("eventId",          Schema.OPTIONAL_STRING_SCHEMA);
+        builder.field("eventType",         Schema.OPTIONAL_STRING_SCHEMA);
+        builder.field("userId",            Schema.OPTIONAL_STRING_SCHEMA);
+        builder.field("eventTime",         Schema.OPTIONAL_INT64_SCHEMA);
+        builder.field("processingTime",    Schema.OPTIONAL_INT64_SCHEMA);
+        builder.field("rules",             SchemaBuilder.array(Schema.INT32_SCHEMA).optional().build());
+        builder.field("actions",           SchemaBuilder.array(Schema.STRING_SCHEMA).optional().build());
+        builder.field("trialRules",        SchemaBuilder.array(Schema.INT32_SCHEMA).optional().build());
+        builder.field("trialActions",      SchemaBuilder.array(Schema.STRING_SCHEMA).optional().build());
+        builder.field("reEvaluateEntity",  Schema.OPTIONAL_STRING_SCHEMA);
+        builder.field("originId",          Schema.OPTIONAL_INT32_SCHEMA);
+        builder.field("originCategory",    Schema.OPTIONAL_STRING_SCHEMA);
+        builder.field("fromUpdateAPI",     Schema.OPTIONAL_BOOLEAN_SCHEMA);
 
-        // Feature columns with proper types from return_type
+        // Feature/event-attribute columns with proper types from return_type
         Set<String> added = new HashSet<>(Arrays.asList(
-                "event_id", "event_type", "user_id", "event_time", "processing_time"));
+                "eventId", "eventType", "userId", "eventTime", "processingTime",
+                "rules", "actions", "trialRules", "trialActions", "reEvaluateEntity",
+                "originId", "originCategory", "fromUpdateAPI"));
 
         for (String[] meta : featureMetadata.values()) {
             String name = meta[0];
@@ -315,6 +334,25 @@ public class FeatureResolverTransform<R extends ConnectRecord<R>> implements Tra
 
     private String toString(Object v) {
         return v == null ? null : v.toString();
+    }
+
+    private List<Integer> toIntList(Object v) {
+        if (!(v instanceof List)) return null;
+        List<?> list = (List<?>) v;
+        List<Integer> result = new ArrayList<>(list.size());
+        for (Object item : list) {
+            if (item instanceof Number) result.add(((Number) item).intValue());
+            else if (item != null) result.add(Integer.parseInt(item.toString()));
+        }
+        return result;
+    }
+
+    private List<String> toStringList(Object v) {
+        if (!(v instanceof List)) return null;
+        List<?> list = (List<?>) v;
+        List<String> result = new ArrayList<>(list.size());
+        for (Object item : list) result.add(item == null ? null : item.toString());
+        return result;
     }
 
     @Override
