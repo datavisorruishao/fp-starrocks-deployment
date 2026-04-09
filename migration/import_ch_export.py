@@ -74,7 +74,7 @@ TABLE_PROPERTIES = {
     "format-version":                                    "2",
     "write.format.default":                              "parquet",
     "write.parquet.compression-codec":                   "zstd",
-    "write.target-file-size-bytes":                      "536870912",
+    "write.target-file-size-bytes":                      "1073741824",  # 1GB — avoid splitting within a single append
     "write.metadata.metrics.default":                    "none",
     "write.metadata.metrics.column.eventTime":           "full",
     "write.metadata.metrics.column.processingTime":      "full",
@@ -251,6 +251,15 @@ def transform_batch(batch: pa.RecordBatch, renames: dict[str, str],
 
         # Apply column rename
         out_name = renames.get(name, name)
+
+        # eventTime and processingTime must be long (ms since epoch) in Iceberg
+        if out_name in ("eventTime", "processingTime") and arr.type == pa.string():
+            arr = pc.cast(arr, pa.int64(), safe=False)
+            field = pa.field(out_name, pa.int64(), nullable=True)
+            fields.append(field)
+            arrays.append(arr)
+            continue
+
         fields.append(pa.field(out_name, field.type, nullable=True))
         arrays.append(arr)
 
@@ -348,9 +357,8 @@ def load_or_create_table(catalog, tenant: str, sample_batch: pa.RecordBatch,
     except NoSuchTableError:
         pass
 
-    # Table does not exist at all — create with 5-column base schema + optimizations,
-    # then evolve schema to add all CH columns.  This mirrors IcebergService.java:
-    # fixed field IDs 1-5 must be established first so partition/sort source-ids are stable.
+    # Table does not exist — create with ALL columns from the batch at once.
+    # Using manual type mapping avoids pyarrow_to_schema field-id requirements.
     try:
         catalog.create_namespace(tenant)
     except Exception:
@@ -359,34 +367,21 @@ def load_or_create_table(catalog, tenant: str, sample_batch: pa.RecordBatch,
     import pyiceberg.types as T
     from pyiceberg.schema import Schema
 
-    base_schema = Schema(
-        T.NestedField(1, "eventId",       T.StringType(), required=False),
-        T.NestedField(2, "eventType",      T.StringType(), required=False),
-        T.NestedField(3, "userId",         T.StringType(), required=False),
-        T.NestedField(4, "eventTime",      T.LongType(),   required=False),
-        T.NestedField(5, "processingTime", T.LongType(),   required=False),
+    # eventTime and processingTime are stored as long (ms since epoch) in Iceberg,
+    # even though CSV import reads them as strings. Force LongType for these.
+    long_columns = {"eventTime", "processingTime"}
+    fields = [
+        T.NestedField(i + 1, f.name,
+                       T.LongType() if f.name in long_columns else _pa_to_iceberg_type(f.type),
+                       required=False)
+        for i, f in enumerate(sample_batch.schema)
+    ]
+    full_schema = Schema(*fields)
+    table = catalog.create_table(
+        full_name, schema=full_schema, properties=TABLE_PROPERTIES,
     )
-    create_kwargs = dict(schema=base_schema, properties=TABLE_PROPERTIES)
-    if no_partition:
-        print(f"  Creating {full_name} WITHOUT partition (bulk import mode)",
-              flush=True)
-    else:
-        create_kwargs["partition_spec"] = TABLE_PARTITION_SPEC
-        create_kwargs["sort_order"] = TABLE_SORT_ORDER
-        print(
-            f"  Creating {full_name} "
-            f"(partition: day(processingTime)+identity(eventType), "
-            f"sort: eventType/eventTime/eventId, bloom: eventId+userId)",
-            flush=True,
-        )
-    table = catalog.create_table(full_name, **create_kwargs)
-
-    # Evolve schema to include all CH columns from the batch (IDs 6+)
-    batch_iceberg_schema = _batch_to_iceberg_schema(sample_batch)
-    with table.update_schema() as upd:
-        upd.union_by_name(batch_iceberg_schema)
-    print(f"  Evolved schema to {len(batch_iceberg_schema.fields) + 5} columns", flush=True)
-    return catalog.load_table(full_name)
+    print(f"  Created {full_name} ({len(fields)} columns, no partition)", flush=True)
+    return table
 
 
 # ---------------------------------------------------------------------------
@@ -449,18 +444,25 @@ def import_file(fpath: str, fs_or_none, renames: dict[str, str],
         print(f"  [dry-run] would append {total_rows:,} rows → {tenant}.event_result")
         return total_rows
 
-    iceberg_table = None
+    # Transform all batches and combine into one large table,
+    # then write in BATCH_SIZE chunks. This avoids creating one file
+    # per CSV reader block (~4300 rows) — instead we get one file per chunk.
+    print(f"  Transforming...", flush=True)
+    transformed_batches = [
+        transform_batch(b, renames, array_columns)
+        for b in full_table.to_batches()
+    ]
+    combined = pa.Table.from_batches(transformed_batches)
+
+    iceberg_table = load_or_create_table(
+        catalog, tenant, transformed_batches[0], no_partition=no_partition,
+    )
+
     appended = 0
-
-    for raw_batch in full_table.to_batches(max_chunksize=BATCH_SIZE):
-        batch = transform_batch(raw_batch, renames, array_columns)
-
-        if iceberg_table is None:
-            iceberg_table = load_or_create_table(catalog, tenant, batch,
-                                                  no_partition=no_partition)
-
-        iceberg_table.append(pa.Table.from_batches([batch]))
-        appended += len(batch)
+    for i in range(0, total_rows, BATCH_SIZE):
+        chunk = combined.slice(i, BATCH_SIZE)
+        iceberg_table.append(chunk)
+        appended += len(chunk)
         print(f"  ... {appended:,}/{total_rows:,} rows appended", flush=True)
 
     return appended
