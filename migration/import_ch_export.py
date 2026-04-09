@@ -45,8 +45,43 @@ import requests
 import s3fs
 from pyiceberg.catalog import load_catalog
 from pyiceberg.exceptions import NoSuchTableError
+from pyiceberg.partitioning import PartitionField, PartitionSpec
+from pyiceberg.table.sorting import NullOrder, SortDirection, SortField, SortOrder
+from pyiceberg.transforms import DayTransform, IdentityTransform
 
 BATCH_SIZE = 50_000   # rows per Iceberg append (wide schema → smaller batches)
+
+# ---------------------------------------------------------------------------
+# Table optimizations — mirrors SINK_TARGETS in IcebergService.java exactly.
+# Field IDs 1-5 correspond to the five fixed base columns (see BASE_FIELDS).
+# ---------------------------------------------------------------------------
+
+# Partition: day(processingTime=5), identity(eventType=2)
+TABLE_PARTITION_SPEC = PartitionSpec(
+    PartitionField(source_id=5, field_id=1000, transform=DayTransform(),    name="processingTime_day"),
+    PartitionField(source_id=2, field_id=1001, transform=IdentityTransform(), name="eventType"),
+)
+
+# Sort: eventType(2) ASC, eventTime(4) ASC, eventId(1) ASC
+TABLE_SORT_ORDER = SortOrder(
+    SortField(source_id=2, transform=IdentityTransform(), direction=SortDirection.ASC, null_order=NullOrder.NULLS_LAST),
+    SortField(source_id=4, transform=IdentityTransform(), direction=SortDirection.ASC, null_order=NullOrder.NULLS_LAST),
+    SortField(source_id=1, transform=IdentityTransform(), direction=SortDirection.ASC, null_order=NullOrder.NULLS_LAST),
+)
+
+TABLE_PROPERTIES = {
+    "format-version":                                    "2",
+    "write.format.default":                              "parquet",
+    "write.parquet.compression-codec":                   "zstd",
+    "write.target-file-size-bytes":                      "536870912",
+    "write.metadata.metrics.default":                    "none",
+    "write.metadata.metrics.column.eventTime":           "full",
+    "write.metadata.metrics.column.processingTime":      "full",
+    "write.metadata.metrics.column.eventType":           "full",
+    "write.metadata.metrics.column.eventId":             "counts",
+    "write.parquet.bloom-filter-enabled.column.eventId": "true",
+    "write.parquet.bloom-filter-enabled.column.userId":  "true",
+}
 
 # Fixed column renames: CH name → Iceberg name (applied to every tenant).
 # Matches the live Kafka Connect + FeatureResolverTransform SMT pipeline output.
@@ -276,34 +311,45 @@ def load_or_create_table(catalog, tenant: str, sample_batch: pa.RecordBatch):
     except NoSuchTableError:
         pass
 
-    # Table does not exist at all — create it from the batch schema.
+    # Table does not exist at all — create with 5-column base schema + optimizations,
+    # then evolve schema to add all CH columns.  This mirrors IcebergService.java:
+    # fixed field IDs 1-5 must be established first so partition/sort source-ids are stable.
     try:
         catalog.create_namespace(tenant)
     except Exception:
         pass  # already exists
 
     import pyiceberg.types as T
-
-    def to_iceberg(t: pa.DataType) -> T.IcebergType:
-        if t == pa.string() or t == pa.large_string():  return T.StringType()
-        if t == pa.int32():                              return T.IntegerType()
-        if t == pa.int64():                              return T.LongType()
-        if t == pa.float32():                            return T.FloatType()
-        if t == pa.float64():                            return T.DoubleType()
-        if t == pa.bool_():                              return T.BooleanType()
-        if pa.types.is_list(t):
-            elem = to_iceberg(t.value_type)
-            return T.ListType(element_id=0, element_type=elem, element_required=False)
-        return T.StringType()  # fallback
-
     from pyiceberg.schema import Schema
-    fields = [
-        T.NestedField(i + 1, f.name, to_iceberg(f.type), required=False)
-        for i, f in enumerate(sample_batch.schema)
-    ]
-    schema = Schema(*fields)
-    catalog.create_table(full_name, schema=schema)
-    print(f"  Created Iceberg table {full_name} ({len(fields)} columns)", flush=True)
+
+    base_schema = Schema(
+        T.NestedField(1, "eventId",       T.StringType(), required=False),
+        T.NestedField(2, "eventType",      T.StringType(), required=False),
+        T.NestedField(3, "userId",         T.StringType(), required=False),
+        T.NestedField(4, "eventTime",      T.LongType(),   required=False),
+        T.NestedField(5, "processingTime", T.LongType(),   required=False),
+    )
+    table = catalog.create_table(
+        full_name,
+        schema=base_schema,
+        partition_spec=TABLE_PARTITION_SPEC,
+        sort_order=TABLE_SORT_ORDER,
+        properties=TABLE_PROPERTIES,
+    )
+    print(
+        f"  Created Iceberg table {full_name} "
+        f"(partition: day(processingTime)+identity(eventType), "
+        f"sort: eventType/eventTime/eventId, bloom: eventId+userId)",
+        flush=True,
+    )
+
+    # Evolve schema to include all CH columns from the batch (IDs 6+)
+    batch_iceberg_schema = pyarrow_to_schema(
+        pa.Table.from_batches([sample_batch]).schema
+    )
+    with table.update_schema() as upd:
+        upd.union_by_name(batch_iceberg_schema)
+    print(f"  Evolved schema to {len(batch_iceberg_schema.fields)} columns", flush=True)
     return catalog.load_table(full_name)
 
 
