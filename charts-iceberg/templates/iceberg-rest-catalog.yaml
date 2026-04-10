@@ -71,7 +71,7 @@ spec:
             - name: CATALOG_IO__IMPL
               value: "org.apache.iceberg.aws.s3.S3FileIO"
             - name: CATALOG_URI
-              value: "jdbc:mysql://{{ .Values.fpMysql.host }}:{{ .Values.fpMysql.port }}/{{ .Values.fpMysql.icebergCatalogDb }}?autoReconnect=true&useSSL=false&connectTimeout=5000&socketTimeout=30000"
+              value: "jdbc:mysql://{{ .Values.fpMysql.host }}:{{ .Values.fpMysql.port }}/{{ .Values.fpMysql.icebergCatalogDb }}?autoReconnect=true&useSSL=false&connectTimeout=5000&socketTimeout=30000&tcpKeepAlive=true"
             - name: CATALOG_JDBC_USER
               valueFrom:
                 secretKeyRef:
@@ -87,15 +87,18 @@ spec:
             - name: AWS_REGION
               value: {{ .Values.iceberg.restCatalog.s3.region | quote }}
           readinessProbe:
-            tcpSocket:
+            httpGet:
+              path: /v1/config
               port: rest
             initialDelaySeconds: 10
             periodSeconds: 10
           livenessProbe:
-            tcpSocket:
+            httpGet:
+              path: /v1/config
               port: rest
             initialDelaySeconds: 20
-            periodSeconds: 20
+            periodSeconds: 30
+            failureThreshold: 3
           resources:
             {{- toYaml .Values.iceberg.restCatalog.resources | nindent 12 }}
           volumeMounts:
