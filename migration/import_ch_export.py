@@ -252,11 +252,20 @@ def transform_batch(batch: pa.RecordBatch, renames: dict[str, str],
         # Apply column rename
         out_name = renames.get(name, name)
 
-        # eventTime and processingTime must be long (ms since epoch) in Iceberg
-        if out_name in ("eventTime", "processingTime") and arr.type == pa.string():
+        # eventTime and processingTime → timestamptz (µs since epoch).
+        # Source values may be seconds or milliseconds — detect by magnitude:
+        #   > 1_000_000_000_000 → milliseconds, multiply by 1_000 → µs
+        #   otherwise           → seconds,      multiply by 1_000_000 → µs
+        if out_name in ("eventTime", "processingTime"):
             arr = pc.cast(arr, pa.int64(), safe=False)
-            field = pa.field(out_name, pa.int64(), nullable=True)
-            fields.append(field)
+            ms_mask = pc.greater(arr, pa.scalar(1_000_000_000_000, pa.int64()))
+            us = pc.if_else(
+                ms_mask,
+                pc.multiply(arr, pa.scalar(1_000, pa.int64())),
+                pc.multiply(arr, pa.scalar(1_000_000, pa.int64())),
+            )
+            arr = us.cast(pa.timestamp("us", tz="UTC"))
+            fields.append(pa.field(out_name, pa.timestamp("us", tz="UTC"), nullable=True))
             arrays.append(arr)
             continue
 
@@ -367,12 +376,12 @@ def load_or_create_table(catalog, tenant: str, sample_batch: pa.RecordBatch,
     import pyiceberg.types as T
     from pyiceberg.schema import Schema
 
-    # eventTime and processingTime are stored as long (ms since epoch) in Iceberg,
-    # even though CSV import reads them as strings. Force LongType for these.
-    long_columns = {"eventTime", "processingTime"}
+    # eventTime and processingTime use timestamptz (µs since epoch) for StarRocks
+    # compatibility with day() partition transform. Other columns use their natural types.
+    ts_columns = {"eventTime", "processingTime"}
     fields = [
         T.NestedField(i + 1, f.name,
-                       T.LongType() if f.name in long_columns else _pa_to_iceberg_type(f.type),
+                       T.TimestamptzType() if f.name in ts_columns else _pa_to_iceberg_type(f.type),
                        required=False)
         for i, f in enumerate(sample_batch.schema)
     ]
