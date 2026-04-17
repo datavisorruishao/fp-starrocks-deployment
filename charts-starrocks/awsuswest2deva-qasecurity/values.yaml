@@ -6,3 +6,6 @@ starrocks:
     s3:
       bucket: datavisor-dev-us-west-2-iceberg
       path: "cre-6630/qa-security/starrocks-data/"
+  auditLoader:
+    enabled: true
+    pluginS3Uri: "s3://datavisor-dev-us-west-2-iceberg/cre-6630/tools/auditloader.zip"

@@ -6,7 +6,7 @@ iceberg:
 
 starrocks:
   fe:
-    image: "starrocks/fe-ubuntu:4.0.8"
+    image: "docker-registry.dv-api.com/cloud/starrocks-fe-ubuntu:4.0.8"
     replicas: 1
     storageSize: 10Gi
     storageClass: aws-ebs-csi
@@ -24,7 +24,7 @@ starrocks:
         memory: 6Gi
 
   cn:
-    image: "starrocks/cn-ubuntu:4.0.8"
+    image: "docker-registry.dv-api.com/cloud/starrocks-cn-ubuntu:4.0.8"
     replicas: 2
     cacheSizeLimit: 30Gi
     resources:
@@ -39,3 +39,7 @@ starrocks:
       minReplicas: 1
       maxReplicas: 3
       targetCPUUtilizationPercentage: 70
+
+  auditLoader:
+    enabled: false
+    pluginS3Uri: ""   # e.g. s3://bucket/path/auditloader.zip

@@ -25,6 +25,8 @@ data:
     aws_s3_endpoint = s3.{{ .Values.starrocks.fe.s3.region }}.amazonaws.com
     aws_s3_bucket = {{ .Values.starrocks.fe.s3.bucket }}
     aws_s3_path = {{ .Values.starrocks.fe.s3.path }}
+
+    plugin_dir = /opt/starrocks/fe/meta/plugins
 ---
 apiVersion: v1
 kind: Service
@@ -74,9 +76,28 @@ spec:
         prometheus.io/port: "8030"
         prometheus.io/path: "/metrics"
     spec:
+      {{- if .Values.starrocks.auditLoader.enabled }}
+      initContainers:
+        - name: download-audit-loader
+          image: amazon/aws-cli:2.17.0
+          command:
+            - sh
+            - -c
+            - |
+              set -euo pipefail
+              aws s3 cp {{ .Values.starrocks.auditLoader.pluginS3Uri | quote }} /plugins/auditloader.zip
+              echo "Downloaded auditloader.zip"
+          env:
+            - name: AWS_REGION
+              value: {{ .Values.starrocks.fe.s3.region | quote }}
+          volumeMounts:
+            - name: audit-loader-download
+              mountPath: /plugins
+      {{- end }}
       containers:
         - name: starrocks-fe
           image: {{ .Values.starrocks.fe.image }}
+          imagePullPolicy: Always
           command: ["/opt/starrocks/fe/bin/start_fe.sh", "--host_type", "FQDN"]
           ports:
             - containerPort: 8030
@@ -108,10 +129,18 @@ spec:
               subPath: fe.conf
             - name: fe-meta
               mountPath: /opt/starrocks/fe/meta
+            {{- if .Values.starrocks.auditLoader.enabled }}
+            - name: audit-loader-download
+              mountPath: /plugins
+            {{- end }}
       volumes:
         - name: fe-config
           configMap:
             name: starrocks-fe-config
+        {{- if .Values.starrocks.auditLoader.enabled }}
+        - name: audit-loader-download
+          emptyDir: {}
+        {{- end }}
   volumeClaimTemplates:
     - metadata:
         name: fe-meta
