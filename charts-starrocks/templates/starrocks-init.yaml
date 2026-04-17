@@ -108,7 +108,7 @@ spec:
                   warehouse      VARCHAR(128)
                 ) ENGINE = OLAP
                 DUPLICATE KEY (queryId, timestamp, queryType)
-                DISTRIBUTED BY HASH (queryId) BUCKETS 3
+                DISTRIBUTED BY HASH (queryId) BUCKETS 2
                 PROPERTIES (
                   'replication_num' = '1',
                   'enable_persistent_index' = 'true'
