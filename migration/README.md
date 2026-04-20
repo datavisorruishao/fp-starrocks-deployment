@@ -195,3 +195,73 @@ SELECT count() FROM rippling.event_result FINAL;
 ```
 
 Counts should match within a small drift (live events that arrived during the import window).
+
+---
+
+# Column-Batched Migration (for wide tables)
+
+For tenants with 2000+ columns where `import_ch_export.py` is too slow (SELECT * on 2400 columns
+takes 2.33s per row even with LIMIT 1), use `migrate_column_batch.py` instead.
+
+This script exports columns in batches of 200, each with `FINAL` for dedup accuracy on
+`ReplacingMergeTree`, then merges batches in Python and appends to Iceberg.
+
+See [docs/migration-guide.md](../docs/migration-guide.md) for the full exploration, production
+benchmarks, and cost estimation.
+
+## Usage
+
+```bash
+# Step 0: Register the table via FP API first
+curl -X POST http://<fp-api>/iceberg/connector/{tenant}
+
+# Step 1: Run migration (dry-run first)
+python migrate_column_batch.py \
+    --tenant rippling \
+    --clickhouse-url http://chi-dv-datavisor-0-0-0.clickhouse.svc:8123 \
+    --clickhouse-db rippling \
+    --iceberg-catalog-url http://iceberg-rest-catalog:8181 \
+    --start-date 2026-03-01 \
+    --end-date 2026-04-01 \
+    --primary-key SSN \
+    --column-batch-size 200 \
+    --aws-region us-west-2 \
+    --dry-run
+
+# Step 2: Run for real (remove --dry-run)
+python migrate_column_batch.py \
+    --tenant rippling \
+    --clickhouse-url http://chi-dv-datavisor-0-0-0.clickhouse.svc:8123 \
+    --clickhouse-db rippling \
+    --iceberg-catalog-url http://iceberg-rest-catalog:8181 \
+    --start-date 2026-03-01 \
+    --end-date 2026-04-01 \
+    --primary-key SSN \
+    --column-batch-size 200 \
+    --aws-region us-west-2 \
+    --sleep-between-days 30
+```
+
+## Production benchmarks (column batch size)
+
+| Batch size | Time per batch | Memory | Recommendation |
+|---|---|---|---|
+| 100 cols | 39s | 301 MB | Conservative |
+| **200 cols** | **109s** | **676 MB** | **Recommended** |
+| 500 cols | >300s (timeout) | 2 GB | Too large |
+
+## Estimated timeline (200 cols/batch, 2400 total columns, 31 days)
+
+```
+Per batch:  ~109s
+Per day:    12 batches × 109s = 22 min + sleep = ~25 min
+31 days:    ~13 hours — run overnight
+```
+
+## Which script to use?
+
+| Scenario | Script |
+|---|---|
+| Tenant has CH exporter CSV.gz files on S3 | `import_ch_export.py` |
+| Tenant has 2000+ columns, no CH exporter | `migrate_column_batch.py` |
+| Both available | `import_ch_export.py` (zero CH load) |
