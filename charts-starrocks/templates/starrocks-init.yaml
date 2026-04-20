@@ -68,4 +68,59 @@ spec:
 
               echo "=== Verifying catalogs ==="
               mysql -h "$HOST" -P "$PORT" -u root --ssl-mode=DISABLED -e "SHOW CATALOGS;"
+
+              echo "=== Creating AuditLoader database and table ==="
+              mysql -h "$HOST" -P "$PORT" -u root --ssl-mode=DISABLED -e "
+                CREATE DATABASE IF NOT EXISTS starrocks_audit_db__;
+              " 2>&1 || echo "Audit database may already exist"
+              mysql -h "$HOST" -P "$PORT" -u root --ssl-mode=DISABLED -e "
+                CREATE TABLE IF NOT EXISTS starrocks_audit_db__.starrocks_audit_tbl__ (
+                  queryId         VARCHAR(64),
+                  timestamp       DATETIME NOT NULL,
+                  queryType       VARCHAR(12),
+                  clientIp        VARCHAR(32),
+                  user            VARCHAR(64),
+                  authorizedUser  VARCHAR(64),
+                  resourceGroup   VARCHAR(64),
+                  catalog         VARCHAR(32),
+                  db              VARCHAR(96),
+                  state           VARCHAR(8),
+                  errorCode       VARCHAR(512),
+                  queryTime       BIGINT,
+                  scanBytes       BIGINT,
+                  scanRows        BIGINT,
+                  returnRows      BIGINT,
+                  cpuCostNs       BIGINT,
+                  memCostBytes    BIGINT,
+                  stmtId          INT,
+                  isQuery         TINYINT,
+                  feIp            VARCHAR(128),
+                  stmt            VARCHAR(1048576),
+                  digest          VARCHAR(32),
+                  planCpuCosts    DOUBLE,
+                  planMemCosts    DOUBLE,
+                  pendingTimeMs   BIGINT,
+                  candidateMVs    VARCHAR(65533) NULL,
+                  hitMvs          VARCHAR(65533) NULL,
+                  warehouse       VARCHAR(32) NULL
+                ) ENGINE = OLAP
+                DUPLICATE KEY (queryId, timestamp, queryType)
+                PARTITION BY date_trunc('day', timestamp)
+                PROPERTIES (
+                  'replication_num' = '{{ .Values.starrocks.cn.replicas | default 1 }}',
+                  'partition_live_number' = '30'
+                );
+              " 2>&1 || echo "Audit table may already exist"
+
+              echo "=== Installing AuditLoader plugin ==="
+              # INSTALL PLUGIN triggers the FE pod to download the zip from the URL.
+              # Requires FE pod to have internet access (NAT gateway or VPC endpoint).
+              # If the plugin is already installed, 'INSTALL PLUGIN' returns an error — safe to ignore.
+              # For clusters without internet, use scripts/setup-audit-loader.sh instead.
+              mysql -h "$HOST" -P "$PORT" -u root --ssl-mode=DISABLED -e "
+                INSTALL PLUGIN FROM 'https://releases.starrocks.io/resources/auditloader.zip';
+              " 2>&1 || echo "AuditLoader may already be installed"
+
+              echo "=== Verifying plugins ==="
+              mysql -h "$HOST" -P "$PORT" -u root --ssl-mode=DISABLED -e "SHOW PLUGINS;"
               echo "=== Init complete ==="
