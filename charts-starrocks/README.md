@@ -10,7 +10,7 @@ Helm chart that deploys StarRocks FE + CN for ad-hoc SQL queries over Iceberg ta
 |----------|-------------|
 | `starrocks-fe` StatefulSet | StarRocks Frontend node (shared-data mode, S3 backend) |
 | `starrocks-cn` Deployment | StarRocks Compute Node (S3 data cache) |
-| `starrocks-init` Job | Post-install Job: registers CN + creates Iceberg external catalog in StarRocks |
+| `starrocks-init` Job | Post-install Job: registers Iceberg catalog, creates audit DB/table, installs AuditLoader plugin |
 
 StarRocks runs in **shared-data mode** — FE stores metadata on EBS, CN caches S3 data locally.
 
@@ -105,3 +105,61 @@ SHOW DATABASES;
 USE <tenant_name>;
 SELECT event_type, count(*) FROM event_result GROUP BY 1 ORDER BY 2 DESC LIMIT 20;
 ```
+
+## Query Audit Log
+
+Every StarRocks query is automatically recorded in `starrocks_audit_db__.starrocks_audit_tbl__`
+via the AuditLoader plugin installed by `starrocks-init`. This enables post-execution analysis
+of resource usage (scan bytes, CPU, memory, wall time) for capacity planning and autoscaling.
+
+### Query audit data
+
+```bash
+# Use the provided script
+NAMESPACE=qa-security ./charts-starrocks/scripts/query-audit.sh
+
+# Or manually
+kubectl exec -it <starrocks-fe-pod> -- mysql -h 127.0.0.1 -P 9030 -u root --table -e "
+SELECT
+    DATE_FORMAT(timestamp, '%H:%i:%S')   AS time,
+    queryTime                            AS wall_ms,
+    scanBytes                            AS scan_bytes,
+    ROUND(cpuCostNs / 1e6, 2)           AS cpu_ms,
+    ROUND(memCostBytes / 1024 / 1024, 2) AS mem_mb,
+    LEFT(stmt, 80)                       AS query
+FROM starrocks_audit_db__.starrocks_audit_tbl__
+WHERE isQuery = 1 AND catalog = 'iceberg_catalog'
+ORDER BY timestamp DESC LIMIT 20;"
+```
+
+### Automatic install
+
+The `starrocks-init` Job creates the audit database/table and installs the AuditLoader plugin
+automatically on every `helm install/upgrade`. The FE pod downloads the plugin zip from
+`releases.starrocks.io` — requires internet access from the cluster (NAT gateway or VPC endpoint).
+
+### Manual install (fallback for clusters without internet)
+
+If the FE pod can't reach the internet, install the plugin manually from a machine with
+both internet and kubectl access:
+
+```bash
+NAMESPACE=qa-security ./charts-starrocks/scripts/setup-audit-loader.sh
+```
+
+This is a one-time operation per cluster. Re-running is safe (idempotent).
+
+### Key audit fields
+
+| Field | Description |
+|---|---|
+| `queryTime` | Wall time ms |
+| `scanBytes` | Bytes read from S3 |
+| `scanRows` | Rows scanned from Parquet |
+| `cpuCostNs` | CPU time nanoseconds |
+| `memCostBytes` | Memory allocated bytes |
+| `planCpuCosts` | Planner cost units (use for relative comparison) |
+| `state` | `EOF` = success, `ERR` = failed |
+
+Audit entries are flushed every **60 seconds** (production default) and retained for **30 days**
+via auto-partition expiry.

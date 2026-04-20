@@ -10,7 +10,7 @@ The project is split into three parts deployed independently:
 |------|-------|-------|--------|
 | 1 — Iceberg storage | `charts-iceberg/` | infra (ruishao) | Production |
 | 2 — FP Java integration | `feature-platform_FP-11811` branch | backend | Production |
-| 3 — StarRocks query engine | `charts-production/` | infra (ruishao) | Production |
+| 3 — StarRocks query engine | `charts-starrocks/` | infra (ruishao) | Production |
 
 ### Architecture
 
@@ -31,7 +31,7 @@ S3 Parquet  (Iceberg format)
     ├──► Iceberg REST Catalog  [charts-iceberg]
     │    (backed by FP MySQL iceberg_catalog DB)
     │
-    └──► StarRocks FE + CN  [charts-production]
+    └──► StarRocks FE + CN  [charts-starrocks]
          (reads Iceberg tables from S3 via REST catalog)
          (used for ad-hoc SQL queries on feature stats)
 ```
@@ -41,13 +41,12 @@ S3 Parquet  (Iceberg format)
 ```
 fp-starrocks-deployment/
 ├── charts-iceberg/          # Part 1 — Iceberg storage pipeline (shared, multi-tenant)
-├── charts-production/       # Part 3 — StarRocks query engine (deploy after charts-iceberg)
+├── charts-starrocks/        # Part 3 — StarRocks query engine (deploy after charts-iceberg)
+│   └── scripts/             # Operational scripts (AuditLoader setup, query audit log)
+├── charts-airflow/          # Airflow scheduler (optional, for batch workflows)
+├── smt/                     # FeatureResolverTransform SMT source — build JAR and upload to S3
+├── migration/               # CH → Iceberg historical data migration scripts
 └── docs/                    # Architecture diagrams and design docs
-    ├── CRE-6630-presentation.md
-    ├── CRE-6630-api-gaps.md
-    ├── brainstorm-summary.md
-    ├── sizing-sheet.md
-    └── starrocks-multi-tenant-architecture.excalidraw
 ```
 
 ## charts-iceberg (Part 1)
@@ -59,11 +58,19 @@ Key components:
 - Kafka Connect workers with the `FeatureResolverTransform` SMT built from source
 - Per-tenant connectors are **not** registered by Helm — FP Java (`IcebergService`) registers them dynamically at tenant provisioning time
 
-## charts-production (Part 3)
+## charts-starrocks (Part 3)
 
-StarRocks FE + CN nodes that query Iceberg tables stored in S3. See [charts-production/README.md](charts-production/README.md).
+StarRocks FE + CN nodes that query Iceberg tables stored in S3. See [charts-starrocks/README.md](charts-starrocks/README.md).
 
-Deploy **after** `charts-iceberg`. The `starrocks-init` Job automatically registers the Iceberg REST Catalog (deployed by `charts-iceberg`) as a StarRocks external catalog.
+Deploy **after** `charts-iceberg`. The `starrocks-init` Job automatically:
+- Registers the Iceberg REST Catalog as a StarRocks external catalog
+- Creates the AuditLoader audit database and table
+- Installs the AuditLoader plugin (requires FE pod internet access)
+
+Query resource metrics for any Iceberg query:
+```bash
+NAMESPACE=<namespace> ./charts-starrocks/scripts/query-audit.sh
+```
 
 ## Credentials
 
