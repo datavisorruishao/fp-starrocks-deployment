@@ -75,7 +75,8 @@ spec:
     spec:
       initContainers:
         - name: register-cn
-          image: mysql:8.0
+          image: docker-registry.dv-api.com/cloud/mysql:8.0.45
+          imagePullPolicy: Always
           command: ["bash", "-c"]
           args:
             - |
@@ -97,6 +98,7 @@ spec:
       containers:
         - name: starrocks-cn
           image: {{ .Values.starrocks.cn.image }}
+          imagePullPolicy: Always
           command: ["/opt/starrocks/cn/bin/start_cn.sh"]
           ports:
             - containerPort: 9050
