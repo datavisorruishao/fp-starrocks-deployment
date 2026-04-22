@@ -1,8 +1,0 @@
-# awsuswest2preproda — preprod namespace on preprod_a cluster
-# helm upgrade --install fp-starrocks ./charts-starrocks -f charts-starrocks/awsuswest2preproda/values.yaml -n preprod
-
-starrocks:
-  fe:
-    s3:
-      bucket: datavisor-preprod-us-west-2-iceberg
-      path: "cre-6630/preprod/starrocks-data/"

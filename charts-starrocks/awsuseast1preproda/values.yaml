@@ -1,6 +1,0 @@
-starrocks:
-  fe:
-    s3:
-      bucket: datavisor-preprod-us-east-1-iceberg
-      region: us-east-1
-      path: "cre-6630/preprod/starrocks-data/"

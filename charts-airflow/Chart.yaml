@@ -1,5 +1,0 @@
-apiVersion: v2
-name: fp-airflow
-description: Apache Airflow (webserver + scheduler + KubernetesExecutor) for CRE-6630
-version: 0.1.0
-appVersion: "3.2.0"

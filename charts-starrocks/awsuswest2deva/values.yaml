@@ -1,8 +1,0 @@
-# awsuswest2deva — duckdb namespace on dev_a cluster
-# helm upgrade --install fp-starrocks ./charts-production -f charts-production/awsuswest2deva/values.yaml -n duckdb
-
-starrocks:
-  fe:
-    s3:
-      bucket: datavisor-dev-us-west-2-iceberg
-      path: "cre-6630/duckdb/starrocks-data/"
